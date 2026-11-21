@@ -99,6 +99,19 @@ func (n *nodeState) DeadOrLeft() bool {
 	return n.State == StateDead || n.State == StateLeft
 }
 
+// clearSuspicionTimer removes and stops any suspicion timer that is
+// currently registered for the node. Stopping the timer (rather than just
+// dropping the map reference) ensures a timer that belonged to an older
+// member generation can no longer fire and advance the current generation
+// after a network reorder or a node re-join. This MUST be called while the
+// nodeLock is held.
+func (m *Memberlist) clearSuspicionTimer(nodeName string) {
+	if timer, ok := m.nodeTimers[nodeName]; ok {
+		timer.Stop()
+		delete(m.nodeTimers, nodeName)
+	}
+}
+
 // ackHandler is used to register handlers for incoming acks and nacks.
 type ackHandler struct {
 	ackFn  func([]byte, time.Time)
@@ -1079,8 +1092,10 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		return
 	}
 
-	// Clear out any suspicion timer that may be in effect.
-	delete(m.nodeTimers, a.Node)
+	// Clear out any suspicion timer that may be in effect. Stopping it
+	// (and not just dropping the map entry) guarantees a timer from an
+	// older generation can't later override this newer alive claim.
+	m.clearSuspicionTimer(a.Node)
 
 	// Store the old state and meta data
 	oldState := state.State
@@ -1220,29 +1235,45 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// Compute the timeouts based on the size of the cluster.
 	min := suspicionTimeout(m.config.SuspicionMult, n, m.config.ProbeInterval)
 	max := time.Duration(m.config.SuspicionMaxTimeoutMult) * min
+
+	// Create the timer up front so the timeout callback can capture its
+	// own identity. When the callback fires it re-checks, under the
+	// nodeLock, that it is still the timer registered for this node and
+	// that the node is still suspect at the same incarnation. A stale timer
+	// left over from an older generation (after an alive refutation, a node
+	// re-join, or an explicit dead message) therefore can never advance the
+	// current member generation, and exactly one terminal dead event is
+	// produced per suspicion lifecycle.
+	var timer *suspicion
 	fn := func(numConfirmations int) {
 		var d *dead
 
 		m.nodeLock.Lock()
-		state, ok := m.nodeMap[s.Node]
-		timeout := ok && state.State == StateSuspect && state.StateChange.Equal(changeTime)
-		if timeout {
-			d = &dead{Incarnation: state.Incarnation, Node: state.Name, From: m.config.Name}
+		current, ok := m.nodeMap[s.Node]
+		active := ok &&
+			m.nodeTimers[s.Node] == timer &&
+			current.State == StateSuspect &&
+			current.Incarnation == s.Incarnation
+		if active {
+			d = &dead{Incarnation: current.Incarnation, Node: current.Name, From: m.config.Name}
 		}
 		m.nodeLock.Unlock()
 
-		if timeout {
-			if k > 0 && numConfirmations < k {
-				metrics.IncrCounterWithLabels([]string{"memberlist", "degraded", "timeout"}, 1, m.metricLabels)
-			}
-
-			m.logger.Printf("[INFO] memberlist: Marking %s as failed, suspect timeout reached (%d peer confirmations)",
-				state.Name, numConfirmations)
-
-			m.deadNode(d)
+		if !active {
+			return
 		}
+
+		if k > 0 && numConfirmations < k {
+			metrics.IncrCounterWithLabels([]string{"memberlist", "degraded", "timeout"}, 1, m.metricLabels)
+		}
+
+		m.logger.Printf("[INFO] memberlist: Marking %s as failed, suspect timeout reached (%d peer confirmations)",
+			s.Node, numConfirmations)
+
+		m.deadNode(d)
 	}
-	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+	timer = newSuspicion(s.From, k, min, max, fn)
+	m.nodeTimers[s.Node] = timer
 }
 
 // deadNode is invoked by the network layer when we get a message
@@ -1262,8 +1293,10 @@ func (m *Memberlist) deadNode(d *dead) {
 		return
 	}
 
-	// Clear out any suspicion timer that may be in effect.
-	delete(m.nodeTimers, d.Node)
+	// Clear out any suspicion timer that may be in effect. Stopping it
+	// ensures the timeout path can't declare the node dead a second time
+	// after this terminal state has already been recorded.
+	m.clearSuspicionTimer(d.Node)
 
 	// Ignore if node is already dead
 	if state.DeadOrLeft() {

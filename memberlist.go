@@ -218,9 +218,12 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
-		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
-		logger:               logger,
-		metricLabels:         conf.MetricLabels,
+		broadcasts: &TransmitLimitedQueue{
+			RetransmitMult: conf.RetransmitMult,
+			MaxBroadcasts:  conf.MaxBroadcasts,
+		},
+		logger:       logger,
+		metricLabels: conf.MetricLabels,
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
@@ -749,6 +752,15 @@ func (m *Memberlist) Shutdown() error {
 	m.shutdown.Store(1)
 	close(m.shutdownCh)
 	m.deschedule()
+
+	// Stop any in-flight suspicion timers so callbacks belonging to this
+	// memberlist can't fire after it has been shut down.
+	m.nodeLock.Lock()
+	for name, timer := range m.nodeTimers {
+		timer.Stop()
+		delete(m.nodeTimers, name)
+	}
+	m.nodeLock.Unlock()
 	return nil
 }
 

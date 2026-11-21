@@ -78,6 +78,15 @@ type Config struct {
 	// at the expense of increased bandwidth.
 	RetransmitMult int
 
+	// MaxBroadcasts is the maximum number of gossip messages that may be
+	// queued for retransmission at once. When a new broadcast would exceed
+	// this limit the oldest queued message is evicted; since a newer message
+	// about a node invalidates earlier messages for the same node, the queue
+	// retains the latest (terminal) state of each node instead of
+	// intermediate oscillations. A value of zero leaves the queue
+	// unbounded, which matches the historical default.
+	MaxBroadcasts int
+
 	// SuspicionMult is the multiplier for determining the time an
 	// inaccessible node is considered suspect before declaring it dead.
 	// The actual timeout is calculated using the formula:

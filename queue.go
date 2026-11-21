@@ -24,6 +24,15 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
+	// MaxBroadcasts optionally bounds the number of queued messages. A
+	// value of zero (the default) leaves the queue unbounded, preserving
+	// the historical behavior. When a new broadcast would exceed the limit
+	// the oldest message is evicted first. Because enqueuing a broadcast
+	// about a node already invalidates any earlier message about that same
+	// node (see NamedBroadcast), eviction under load keeps the most recent
+	// (terminal) state of each node rather than intermediate oscillations.
+	MaxBroadcasts int
+
 	mu    sync.Mutex
 	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
 	tm    map[string]*limitedBroadcast
@@ -228,6 +237,24 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 
 	// Append to the relevant queue.
 	q.addItem(lb)
+
+	// Enforce the optional size bound. The btree orders items with the
+	// freshest (lowest transmit count, newest id) at the minimum and the
+	// oldest pending broadcast at the maximum, so Max() is the stalest
+	// message and is what we sacrifice. Evicted messages still get their
+	// Finished() callback, keeping delegate notification semantics
+	// identical to invalidation or retransmit-limit removal.
+	if q.MaxBroadcasts > 0 {
+		for q.tq.Len() > q.MaxBroadcasts {
+			oldest := q.tq.Max()
+			if oldest == nil {
+				break
+			}
+			cur := oldest.(*limitedBroadcast)
+			cur.b.Finished()
+			q.deleteItem(cur)
+		}
+	}
 }
 
 // deleteItem removes the given item from the overall datastructure. You

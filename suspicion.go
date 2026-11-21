@@ -5,6 +5,7 @@ package memberlist
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -40,6 +41,12 @@ type suspicion struct {
 	// because there are cases where we call it directly.
 	timeoutFn func()
 
+	// once makes sure the timeout function is invoked at most a single
+	// time, regardless of how many timers or goroutines end up driving
+	// the expiration. This guarantees a single terminal event per
+	// suspicion lifecycle.
+	once sync.Once
+
 	// confirmations is a map of "from" nodes that have confirmed a given
 	// node is suspect. This prevents double counting.
 	confirmations map[string]struct{}
@@ -62,9 +69,14 @@ func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn f
 	s.confirmations[from] = struct{}{}
 
 	// Pass the number of confirmations into the timeout function for
-	// easy telemetry.
+	// easy telemetry. The sync.Once wrapper makes the expiration
+	// idempotent: whether it is reached by the underlying timer or
+	// invoked directly from Confirm after the remaining time underflows,
+	// the callback fires exactly once.
 	s.timeoutFn = func() {
-		fn(int(s.n.Load()))
+		s.once.Do(func() {
+			fn(int(s.n.Load()))
+		})
 	}
 
 	// If there aren't any confirmations to be made then take the min
@@ -130,4 +142,14 @@ func (s *suspicion) Confirm(from string) bool {
 		}
 	}
 	return true
+}
+
+// Stop cancels the suspicion timer. It is safe to call concurrently with
+// Confirm and with the timeout callback, and it is a no-op once the timer
+// has already fired. After Stop returns, the timeout function will not run
+// unless it had already started. This is used to retire a timer that
+// belongs to an older member generation when the node refutes the
+// suspicion, is declared dead, or the memberlist shuts down.
+func (s *suspicion) Stop() {
+	s.timer.Stop()
 }
