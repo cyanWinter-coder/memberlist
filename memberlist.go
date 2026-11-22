@@ -497,12 +497,15 @@ func (m *Memberlist) refreshAdvertise() (net.IP, int, error) {
 	return addr, port, nil
 }
 
-// LocalNode is used to return the local Node
+// LocalNode is used to return the local Node. Like Members, the returned
+// node is a copy made under the node lock, so it is a consistent snapshot
+// rather than a live view into state that may be mid-transition.
 func (m *Memberlist) LocalNode() *Node {
 	m.nodeLock.RLock()
 	defer m.nodeLock.RUnlock()
 	state := m.nodeMap[m.config.Name]
-	return &state.Node
+	node := state.Node
+	return &node
 }
 
 // UpdateNode is used to trigger re-advertising the local node. This is
@@ -602,8 +605,10 @@ func (m *Memberlist) SendReliable(to *Node, msg []byte) error {
 	return m.sendUserMsg(to.FullAddress(), msg)
 }
 
-// Members returns a list of all known live nodes. The node structures
-// returned must not be modified. If you wish to modify a Node, make a
+// Members returns a list of all known live nodes. Each node returned is a
+// copy made while holding the node lock, so it always reflects a complete
+// state of the member at some point in time, never a mix of two states
+// observed mid-transition. If you wish to modify a Node, make a further
 // copy first.
 func (m *Memberlist) Members() []*Node {
 	m.nodeLock.RLock()
@@ -612,7 +617,8 @@ func (m *Memberlist) Members() []*Node {
 	nodes := make([]*Node, 0, len(m.nodes))
 	for _, n := range m.nodes {
 		if !n.DeadOrLeft() {
-			nodes = append(nodes, &n.Node)
+			node := n.Node
+			nodes = append(nodes, &node)
 		}
 	}
 

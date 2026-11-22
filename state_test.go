@@ -2661,3 +2661,265 @@ func verifySampleExists(t *testing.T, name string, sink *metrics.InmemSink) {
 		t.Fatalf("%s sample not emmited", name)
 	}
 }
+
+func TestMemberList_SuspectNode_SupersededByNewerIncarnation(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		c.ProbeInterval = 10 * time.Millisecond
+		c.SuspicionMult = 1
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a := alive{Node: "test", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+
+	// Suspect at incarnation 1, arming the first generation timer.
+	s1 := suspect{Node: "test", Incarnation: 1, From: "first"}
+	m.suspectNode(&s1)
+
+	m.nodeLock.RLock()
+	t1 := m.nodeTimers["test"]
+	m.nodeLock.RUnlock()
+	if t1 == nil {
+		t.Fatalf("expected a suspicion timer")
+	}
+
+	// Clear the broadcast queue so we can observe the re-broadcast.
+	m.broadcasts.Reset()
+
+	// A suspect for a newer incarnation must supersede the old timer
+	// rather than being absorbed as a confirmation of it.
+	s2 := suspect{Node: "test", Incarnation: 2, From: "second"}
+	m.suspectNode(&s2)
+
+	m.nodeLock.RLock()
+	t2 := m.nodeTimers["test"]
+	state := m.nodeMap["test"]
+	m.nodeLock.RUnlock()
+
+	if t2 == nil || t2 == t1 {
+		t.Fatalf("expected a new suspicion timer for the new incarnation")
+	}
+	if state.Incarnation != 2 {
+		t.Fatalf("bad incarnation: %d", state.Incarnation)
+	}
+	if state.State != StateSuspect {
+		t.Fatalf("bad state: %v", state.State)
+	}
+
+	// The newer suspicion should have been re-broadcast exactly once.
+	if m.broadcasts.NumQueued() != 1 {
+		t.Fatalf("expected one queued message")
+	}
+	if messageType(m.broadcasts.orderedView()[0].b.Message()[0]) != suspectMsg {
+		t.Fatalf("expected queued suspect msg")
+	}
+
+	// The new generation timer must still drive the node to dead.
+	time.Sleep(50 * time.Millisecond)
+	if m.getNodeState("test") != StateDead {
+		t.Fatalf("expected node to be dead")
+	}
+	m.nodeLock.RLock()
+	inc := m.nodeMap["test"].Incarnation
+	m.nodeLock.RUnlock()
+	if inc != 2 {
+		t.Fatalf("bad incarnation after timeout: %d", inc)
+	}
+}
+
+func TestMemberList_SuspectNode_StaleTimerCannotAffectNewGeneration(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		// Long timeouts so the real timers never fire during the test;
+		// stale timers are invoked directly to simulate a late fire.
+		c.ProbeInterval = time.Hour
+		c.SuspicionMult = 5
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a := alive{Node: "test", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+
+	// Arm a suspicion timer at incarnation 1 and keep a handle on it.
+	s1 := suspect{Node: "test", Incarnation: 1, From: "first"}
+	m.suspectNode(&s1)
+
+	m.nodeLock.RLock()
+	stale := m.nodeTimers["test"]
+	m.nodeLock.RUnlock()
+	if stale == nil {
+		t.Fatalf("expected a suspicion timer")
+	}
+
+	// Supersede it with a newer incarnation.
+	s2 := suspect{Node: "test", Incarnation: 2, From: "second"}
+	m.suspectNode(&s2)
+
+	// Drain the broadcasts from both suspicions.
+	m.broadcasts.Reset()
+
+	// Simulate the stale timer firing late: it must not produce a
+	// terminal event for the new generation.
+	stale.timeoutFn()
+
+	m.nodeLock.RLock()
+	state := m.nodeMap["test"]
+	m.nodeLock.RUnlock()
+	if state.State != StateSuspect || state.Incarnation != 2 {
+		t.Fatalf("stale timer affected new generation: state=%v inc=%d", state.State, state.Incarnation)
+	}
+	if m.broadcasts.NumQueued() != 0 {
+		t.Fatalf("stale timer produced a terminal event")
+	}
+}
+
+func TestMemberList_AliveNode_CancelsSuspicionTimer(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		c.ProbeInterval = 10 * time.Millisecond
+		c.SuspicionMult = 1
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a := alive{Node: "test", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+
+	// Suspect the node, arming a timer with a short timeout.
+	s := suspect{Node: "test", Incarnation: 1, From: "peer"}
+	m.suspectNode(&s)
+
+	m.nodeLock.RLock()
+	stale := m.nodeTimers["test"]
+	m.nodeLock.RUnlock()
+	if stale == nil {
+		t.Fatalf("expected a suspicion timer")
+	}
+
+	// A newer alive refutes the suspicion and must cancel the timer.
+	a.Incarnation = 2
+	m.aliveNode(&a, nil, false)
+
+	m.nodeLock.RLock()
+	_, ok := m.nodeTimers["test"]
+	m.nodeLock.RUnlock()
+	if ok {
+		t.Fatalf("suspicion timer not cleared by alive")
+	}
+
+	// Simulate the cancelled timer firing late: the alive node must not
+	// be marked dead by the old generation.
+	stale.timeoutFn()
+	if m.getNodeState("test") != StateAlive {
+		t.Fatalf("cancelled timer killed a live node")
+	}
+
+	// Wait well past the original suspicion timeout; the node must
+	// remain alive.
+	time.Sleep(50 * time.Millisecond)
+	if m.getNodeState("test") != StateAlive {
+		t.Fatalf("old suspicion timer fired into new generation")
+	}
+}
+
+func TestMemberList_DeadNode_CancelsSuspicionTimer(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		c.ProbeInterval = time.Hour
+		c.SuspicionMult = 5
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a := alive{Node: "test", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+
+	s := suspect{Node: "test", Incarnation: 1, From: "peer"}
+	m.suspectNode(&s)
+
+	m.nodeLock.RLock()
+	stale := m.nodeTimers["test"]
+	m.nodeLock.RUnlock()
+	if stale == nil {
+		t.Fatalf("expected a suspicion timer")
+	}
+
+	d := dead{Node: "test", Incarnation: 1, From: "peer"}
+	m.deadNode(&d)
+
+	m.nodeLock.RLock()
+	_, ok := m.nodeTimers["test"]
+	m.nodeLock.RUnlock()
+	if ok {
+		t.Fatalf("suspicion timer not cleared by dead")
+	}
+
+	// A late fire of the cancelled timer must be a no-op: the node is
+	// already dead and no second terminal event may be produced.
+	m.broadcasts.Reset()
+	stale.timeoutFn()
+	if m.broadcasts.NumQueued() != 0 {
+		t.Fatalf("cancelled timer produced a duplicate terminal event")
+	}
+	if m.getNodeState("test") != StateDead {
+		t.Fatalf("bad state")
+	}
+}
+
+func TestMemberList_Members_ConsistentSnapshot(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a := alive{Node: "test", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Meta: []byte("v1"), Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+
+	// Take a snapshot of the membership.
+	var snapshot *Node
+	for _, n := range m.Members() {
+		if n.Name == "test" {
+			snapshot = n
+		}
+	}
+	if snapshot == nil {
+		t.Fatalf("expected test node in members")
+	}
+
+	// Transition the node through a new incarnation and then to dead.
+	a.Incarnation = 2
+	a.Meta = []byte("v2")
+	m.aliveNode(&a, nil, false)
+	d := dead{Node: "test", Incarnation: 2, From: "peer"}
+	m.deadNode(&d)
+
+	// The previously returned snapshot must remain a complete old
+	// version, not a mix of the two states.
+	if string(snapshot.Meta) != "v1" {
+		t.Fatalf("snapshot meta mutated: %s", snapshot.Meta)
+	}
+	if snapshot.State != StateAlive {
+		t.Fatalf("snapshot state mutated: %v", snapshot.State)
+	}
+
+	// A fresh query reflects the new complete version: the dead node is
+	// no longer returned.
+	for _, n := range m.Members() {
+		if n.Name == "test" {
+			t.Fatalf("dead node returned by Members")
+		}
+	}
+}

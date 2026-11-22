@@ -99,6 +99,15 @@ func remainingSuspicionTime(n, k int32, elapsed time.Duration, min, max time.Dur
 	return timeout - elapsed
 }
 
+// Cancel stops the suspicion timer so it can no longer fire. This is
+// best-effort: a timeout callback that has already started is rejected by
+// the terminal-state check the caller performs inside the callback, so a
+// cancelled timer can never produce a terminal event for a newer
+// generation of the node.
+func (s *suspicion) Cancel() {
+	s.timer.Stop()
+}
+
 // Confirm registers that a possibly new peer has also determined the given
 // node is suspect. This returns true if this was new information, and false
 // if it was a duplicate confirmation, or if we've got enough confirmations to

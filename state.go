@@ -935,6 +935,18 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 	m.encodeAndBroadcast(me.Addr.String(), aliveMsg, a)
 }
 
+// cancelNodeTimerLocked stops and removes any suspicion timer registered
+// for the given node. It MUST be called with the nodeLock held. Stopping
+// the timer is best-effort; a callback that already fired is rejected by
+// the terminal-state check in the suspicion timeout function, so a stale
+// timer can never deliver a terminal event into a newer generation.
+func (m *Memberlist) cancelNodeTimerLocked(name string) {
+	if timer, ok := m.nodeTimers[name]; ok {
+		timer.Cancel()
+		delete(m.nodeTimers, name)
+	}
+}
+
 // aliveNode is invoked by the network layer when we get a message about a
 // live node.
 func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
@@ -1079,8 +1091,11 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		return
 	}
 
-	// Clear out any suspicion timer that may be in effect.
-	delete(m.nodeTimers, a.Node)
+	// Clear out any suspicion timer that may be in effect. The alive
+	// message is for this or a newer incarnation, so the suspicion it
+	// may have replaced belongs to an older generation whose timer must
+	// not be allowed to deliver a terminal event.
+	m.cancelNodeTimerLocked(a.Node)
 
 	// Store the old state and meta data
 	oldState := state.State
@@ -1174,14 +1189,27 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// independent confirmations to flow even when a node probes a node
 	// that's already suspect.
 	if timer, ok := m.nodeTimers[s.Node]; ok {
-		if timer.Confirm(s.From) {
-			m.encodeAndBroadcast(s.Node, suspectMsg, s)
+		if s.Incarnation == state.Incarnation {
+			// Same generation: confirm the active timer. Repeated
+			// confirmations from the same peer are idempotent.
+			if timer.Confirm(s.From) {
+				m.encodeAndBroadcast(s.Node, suspectMsg, s)
+			}
+			return
 		}
-		return
+
+		// The suspicion is for a newer incarnation than the one the
+		// active timer belongs to. Cancel the old timer so it cannot
+		// deliver a terminal event into the new generation, then fall
+		// through to arm a fresh timer for the new incarnation.
+		timer.Cancel()
+		delete(m.nodeTimers, s.Node)
 	}
 
-	// Ignore non-alive nodes
-	if state.State != StateAlive {
+	// Ignore nodes that are not in a live state. A suspect node only
+	// reaches this point when its previous suspicion was just superseded
+	// by a newer incarnation above.
+	if state.State != StateAlive && state.State != StateSuspect {
 		return
 	}
 
@@ -1200,8 +1228,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// Update the state
 	state.Incarnation = s.Incarnation
 	state.State = StateSuspect
-	changeTime := time.Now()
-	state.StateChange = changeTime
+	state.StateChange = time.Now()
 
 	// Setup a suspicion timer. Given that we don't have any known phase
 	// relationship with our peers, we set up k such that we hit the nominal
@@ -1220,12 +1247,22 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// Compute the timeouts based on the size of the cluster.
 	min := suspicionTimeout(m.config.SuspicionMult, n, m.config.ProbeInterval)
 	max := time.Duration(m.config.SuspicionMaxTimeoutMult) * min
+
+	// The timeout closure is armed below, together with the timer it
+	// belongs to. It only produces a terminal event when the node
+	// identity, the incarnation, and the currently registered timer all
+	// still match the generation that armed it; a timer from a superseded
+	// generation (cancelled by a newer alive, suspect, or dead message)
+	// can never mark the node dead.
+	var susp *suspicion
 	fn := func(numConfirmations int) {
 		var d *dead
 
 		m.nodeLock.Lock()
 		state, ok := m.nodeMap[s.Node]
-		timeout := ok && state.State == StateSuspect && state.StateChange.Equal(changeTime)
+		timeout := ok && state.State == StateSuspect &&
+			state.Incarnation == s.Incarnation &&
+			m.nodeTimers[s.Node] == susp
 		if timeout {
 			d = &dead{Incarnation: state.Incarnation, Node: state.Name, From: m.config.Name}
 		}
@@ -1237,12 +1274,17 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			}
 
 			m.logger.Printf("[INFO] memberlist: Marking %s as failed, suspect timeout reached (%d peer confirmations)",
-				state.Name, numConfirmations)
+				s.Node, numConfirmations)
 
 			m.deadNode(d)
 		}
 	}
-	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+	// Arm the timer and register it as the active one for this node. The
+	// closure above takes the nodeLock, which we hold until after the
+	// registration completes, so it can never observe susp unassigned or
+	// run before the timer is the registered one.
+	susp = newSuspicion(s.From, k, min, max, fn)
+	m.nodeTimers[s.Node] = susp
 }
 
 // deadNode is invoked by the network layer when we get a message
@@ -1262,8 +1304,10 @@ func (m *Memberlist) deadNode(d *dead) {
 		return
 	}
 
-	// Clear out any suspicion timer that may be in effect.
-	delete(m.nodeTimers, d.Node)
+	// Clear out any suspicion timer that may be in effect. Death is a
+	// terminal state for this incarnation, so no suspicion timer may
+	// outlive it.
+	m.cancelNodeTimerLocked(d.Node)
 
 	// Ignore if node is already dead
 	if state.DeadOrLeft() {
