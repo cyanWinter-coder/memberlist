@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"hash/fnv"
 	"io"
 	"math"
 	"net"
@@ -179,6 +180,37 @@ type pushPullHeader struct {
 	Nodes        int
 	UserStateLen int  // Encodes the byte lengh of user state
 	Join         bool // Is this a join request or a anti-entropy run
+	// Gen is the sender's membership generation: a fold over the
+	// (name, incarnation, state) tuples of the sender's member table,
+	// computed over the exact snapshot this transfer carries. It lets the
+	// receiver tell two snapshots of the same peer apart and detect stale
+	// views. Zero means "unknown" and is what peers built before this
+	// field existed send; the merge does not depend on it.
+	Gen uint64
+}
+
+// remoteState is the membership snapshot received from a peer during a
+// push/pull sync, along with the generation the peer advertised for it.
+type remoteState struct {
+	nodes     []pushNodeState
+	userState []byte
+	gen       uint64 // 0 if the peer did not advertise a generation
+}
+
+// membershipGeneration folds a member table snapshot into a single
+// generation value. Any change to a node's name, incarnation or state
+// changes the generation, so two snapshots of the same table can be
+// compared for equality without exchanging the table itself.
+func membershipGeneration(nodes []pushNodeState) uint64 {
+	h := fnv.New64a()
+	var buf [5]byte
+	for i := range nodes {
+		_, _ = h.Write([]byte(nodes[i].Name))
+		binary.BigEndian.PutUint32(buf[:4], nodes[i].Incarnation)
+		buf[4] = byte(nodes[i].State)
+		_, _ = h.Write(buf[:])
+	}
+	return h.Sum64()
 }
 
 // userMsgHeader is used to encapsulate a userMsg
@@ -316,18 +348,18 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 			return
 		}
 
-		join, remoteNodes, userState, err := m.readRemoteState(bufConn, dec)
+		header, remoteNodes, userState, err := m.readRemoteState(bufConn, dec)
 		if err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to read remote state: %s %s", err, LogConn(conn))
 			return
 		}
 
-		if err := m.sendLocalState(conn, join, streamLabel); err != nil {
+		if err := m.sendLocalState(conn, header.Join, streamLabel); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to push local state: %s %s", err, LogConn(conn))
 			return
 		}
 
-		if err := m.mergeRemoteState(join, remoteNodes, userState); err != nil {
+		if err := m.mergeRemoteState(header.Join, remoteNodes, userState); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed push/pull merge: %s %s", err, LogConn(conn))
 			return
 		}
@@ -961,26 +993,41 @@ func (m *Memberlist) sendUserMsg(a Address, sendBuf []byte) error {
 }
 
 // sendAndReceiveState is used to initiate a push/pull over a stream with a
-// remote host.
-func (m *Memberlist) sendAndReceiveState(a Address, join bool) ([]pushNodeState, []byte, error) {
+// remote host. The exchange is abortable: if the node shuts down while the
+// sync is in flight, the connection is released and an error is returned so
+// the caller can discard the partial result instead of merging it.
+func (m *Memberlist) sendAndReceiveState(a Address, join bool) (*remoteState, error) {
 	if a.Name == "" && m.config.RequireNodeNames {
-		return nil, nil, errNodeNamesAreRequired
+		return nil, errNodeNamesAreRequired
 	}
 
 	// Attempt to connect
 	conn, err := m.transport.DialAddressTimeout(a, m.config.TCPTimeout)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer func() {
 		_ = conn.Close()
 	}()
+
+	// Release the connection promptly on shutdown so a canceled sync cannot
+	// block on a peer that has stopped answering.
+	syncDone := make(chan struct{})
+	defer close(syncDone)
+	go func() {
+		select {
+		case <-m.shutdownCh:
+			_ = conn.Close()
+		case <-syncDone:
+		}
+	}()
+
 	m.logger.Printf("[DEBUG] memberlist: Initiating push/pull sync with: %s %s", a.Name, conn.RemoteAddr())
 	metrics.IncrCounterWithLabels([]string{"memberlist", "tcp", "connect"}, 1, m.metricLabels)
 
 	// Send our state
 	if err := m.sendLocalState(conn, join, m.config.Label); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if err := conn.SetDeadline(time.Now().Add(m.config.TCPTimeout)); err != nil {
@@ -988,26 +1035,29 @@ func (m *Memberlist) sendAndReceiveState(a Address, join bool) ([]pushNodeState,
 	}
 	msgType, bufConn, dec, err := m.readStream(conn, m.config.Label)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if msgType == errMsg {
 		var resp errResp
 		if err := dec.Decode(&resp); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return nil, nil, fmt.Errorf("remote error: %v", resp.Error)
+		return nil, fmt.Errorf("remote error: %v", resp.Error)
 	}
 
 	// Quit if not push/pull
 	if msgType != pushPullMsg {
 		err := fmt.Errorf("received invalid msgType (%d), expected pushPullMsg (%d) %s", msgType, pushPullMsg, LogConn(conn))
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Read remote state
-	_, remoteNodes, userState, err := m.readRemoteState(bufConn, dec)
-	return remoteNodes, userState, err
+	header, remoteNodes, userState, err := m.readRemoteState(bufConn, dec)
+	if err != nil {
+		return nil, err
+	}
+	return &remoteState{nodes: remoteNodes, userState: userState, gen: header.Gen}, nil
 }
 
 // sendLocalState is invoked to send our local state over a stream connection.
@@ -1059,8 +1109,14 @@ func (m *Memberlist) sendLocalState(conn net.Conn, join bool, streamLabel string
 	// Create a bytes buffer writer
 	bufConn := bytes.NewBuffer(nil)
 
-	// Send our node state
-	header := pushPullHeader{Nodes: len(localNodes), UserStateLen: len(userData), Join: join}
+	// Send our node state. The generation is computed over the frozen
+	// snapshot above, so it always describes the exact table we transfer.
+	header := pushPullHeader{
+		Nodes:        len(localNodes),
+		UserStateLen: len(userData),
+		Join:         join,
+		Gen:          membershipGeneration(localNodes),
+	}
 	hd := codec.MsgpackHandle{}
 	enc := codec.NewEncoder(bufConn, &hd)
 
@@ -1234,15 +1290,15 @@ func (m *Memberlist) readStream(conn net.Conn, streamLabel string) (messageType,
 }
 
 // readRemoteState is used to read the remote state from a connection
-func (m *Memberlist) readRemoteState(bufConn io.Reader, dec *codec.Decoder) (bool, []pushNodeState, []byte, error) {
+func (m *Memberlist) readRemoteState(bufConn io.Reader, dec *codec.Decoder) (pushPullHeader, []pushNodeState, []byte, error) {
 	// Read the push/pull header
 	var header pushPullHeader
 	if err := dec.Decode(&header); err != nil {
-		return false, nil, nil, err
+		return pushPullHeader{}, nil, nil, err
 	}
 
 	if header.Nodes < 0 || header.Nodes > maxPushStateNodes {
-		return false, nil, nil, fmt.Errorf("number of nodes in header (%d) exceeds limit", header.Nodes)
+		return pushPullHeader{}, nil, nil, fmt.Errorf("number of nodes in header (%d) exceeds limit", header.Nodes)
 	}
 
 	// Allocate space for the transfer
@@ -1251,12 +1307,12 @@ func (m *Memberlist) readRemoteState(bufConn io.Reader, dec *codec.Decoder) (boo
 	// Try to decode all the states
 	for i := 0; i < header.Nodes; i++ {
 		if err := dec.Decode(&remoteNodes[i]); err != nil {
-			return false, nil, nil, err
+			return pushPullHeader{}, nil, nil, err
 		}
 	}
 
 	if header.UserStateLen < 0 || header.UserStateLen > maxPushStateBytes {
-		return false, nil, nil, fmt.Errorf("user state length (%d) exceeds limit", header.UserStateLen)
+		return pushPullHeader{}, nil, nil, fmt.Errorf("user state length (%d) exceeds limit", header.UserStateLen)
 	}
 
 	// Read the remote user state into a buffer
@@ -1270,7 +1326,7 @@ func (m *Memberlist) readRemoteState(bufConn io.Reader, dec *codec.Decoder) (boo
 				bytes, header.UserStateLen)
 		}
 		if err != nil {
-			return false, nil, nil, err
+			return pushPullHeader{}, nil, nil, err
 		}
 	}
 
@@ -1282,10 +1338,13 @@ func (m *Memberlist) readRemoteState(bufConn io.Reader, dec *codec.Decoder) (boo
 		}
 	}
 
-	return header.Join, remoteNodes, userBuf, nil
+	return header, remoteNodes, userBuf, nil
 }
 
-// mergeRemoteState is used to merge the remote state with our local state
+// mergeRemoteState is used to merge the remote state with our local state.
+// Any validation failure (protocol verification, merge delegate rejection)
+// aborts before the local member table is touched, so a rejected snapshot
+// leaves the local state fully intact.
 func (m *Memberlist) mergeRemoteState(join bool, remoteNodes []pushNodeState, userBuf []byte) error {
 	if err := m.verifyProtocol(remoteNodes); err != nil {
 		return err

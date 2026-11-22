@@ -5,6 +5,7 @@ package memberlist
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -667,19 +668,86 @@ func (m *Memberlist) pushPull() {
 }
 
 // pushPullNode does a complete state exchange with a specific node.
+//
+// The exchange is a rollback-able state transition: the local membership
+// versions are frozen before any bytes are exchanged, the remote snapshot is
+// received in full (or not at all), and the merge only then applies the
+// remote entries that are newer than the local declaration for the same node
+// key. A failed, canceled, or shut-down sync releases the connection and
+// leaves the local member table untouched.
 func (m *Memberlist) pushPullNode(a Address, join bool) error {
 	defer metrics.MeasureSinceWithLabels([]string{"memberlist", "pushPullNode"}, time.Now(), m.metricLabels)
 
+	// Freeze the local membership versions at the start of the sync. The
+	// remote snapshot is later merged per node key against the live table,
+	// but the frozen view lets us detect how much the local table advanced
+	// while the sync was in flight.
+	frozen := m.snapshotGenerations()
+
 	// Attempt to send and receive with the node
-	remote, userState, err := m.sendAndReceiveState(a, join)
+	remote, err := m.sendAndReceiveState(a, join)
 	if err != nil {
 		return err
 	}
 
-	if err := m.mergeRemoteState(join, remote, userState); err != nil {
+	// If the node shut down while the exchange was in flight, discard the
+	// remote snapshot: the local table must remain exactly as it was.
+	if m.hasShutdown() {
+		return errSyncAborted
+	}
+
+	m.observeSyncStaleness(frozen, remote)
+
+	if err := m.mergeRemoteState(join, remote.nodes, remote.userState); err != nil {
 		return err
 	}
 	return nil
+}
+
+// errSyncAborted is returned when a push/pull sync completes its exchange
+// after the node has shut down; the received snapshot is discarded.
+var errSyncAborted = errors.New("memberlist: push/pull sync aborted by shutdown")
+
+// nodeGeneration is the version of a single member of the local table at a
+// point in time: its incarnation number and declared state.
+type nodeGeneration struct {
+	Incarnation uint32
+	State       NodeStateType
+}
+
+// snapshotGenerations freezes the local membership versions, returning a
+// per-node-key view that stays valid to compare against after a push/pull
+// exchange, no matter how the live table changes in the meantime.
+func (m *Memberlist) snapshotGenerations() map[string]nodeGeneration {
+	m.nodeLock.RLock()
+	defer m.nodeLock.RUnlock()
+	gens := make(map[string]nodeGeneration, len(m.nodes))
+	for _, n := range m.nodes {
+		gens[n.Name] = nodeGeneration{Incarnation: n.Incarnation, State: n.State}
+	}
+	return gens
+}
+
+// observeSyncStaleness compares the received remote snapshot against the
+// local versions frozen when the sync started, and reports how many remote
+// entries were already stale before the merge even began. It is purely
+// observational; the authoritative recency check happens per node key under
+// lock during the merge itself.
+func (m *Memberlist) observeSyncStaleness(frozen map[string]nodeGeneration, remote *remoteState) {
+	stale := 0
+	for i := range remote.nodes {
+		r := &remote.nodes[i]
+		if r.Name == m.config.Name {
+			continue
+		}
+		if gen, ok := frozen[r.Name]; ok && r.Incarnation < gen.Incarnation {
+			stale++
+		}
+	}
+	if stale > 0 {
+		m.logger.Printf("[DEBUG] memberlist: Push/Pull snapshot (remote gen %d) carried %d entries older than the local view at sync start", remote.gen, stale)
+	}
+	metrics.AddSampleWithLabels([]string{"memberlist", "pushPull", "stale"}, float32(stale), m.metricLabels)
 }
 
 // verifyProtocol verifies that all the remote nodes can speak with our
@@ -1307,9 +1375,19 @@ func (m *Memberlist) deadNode(d *dead) {
 }
 
 // mergeState is invoked by the network layer when we get a Push/Pull
-// state transfer
+// state transfer.
+//
+// The merge runs as a two-phase, per-node-key state transition. First a
+// plan is computed under the read lock, keeping only the remote entries
+// whose incarnation and state can advance the local declaration for that
+// node key. The planned entries are then applied one node at a time through
+// the regular gossip handlers, which re-validate the entry against the live
+// table under the write lock. A remote snapshot can therefore never regress
+// a node that advanced locally while the sync was in flight (for example
+// demote a just-confirmed alive node back to suspect), and concurrent
+// push/pull syncs merge per node key instead of overwriting the whole table.
 func (m *Memberlist) mergeState(remote []pushNodeState) {
-	for _, r := range remote {
+	for _, r := range m.planMerge(remote) {
 		switch r.State {
 		case StateAlive:
 			a := alive{
@@ -1334,4 +1412,55 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 			m.suspectNode(&s)
 		}
 	}
+}
+
+// planMerge filters a remote membership snapshot down to the entries that
+// can advance the local member table. The check is done per node key against
+// the current local declaration, so entries made stale by local progress are
+// dropped before they can trigger any broadcast or state change. The plan is
+// a filter, not the authority: the gossip handlers re-validate every planned
+// entry under the write lock when it is applied.
+func (m *Memberlist) planMerge(remote []pushNodeState) []pushNodeState {
+	m.nodeLock.RLock()
+	defer m.nodeLock.RUnlock()
+	accepted := make([]pushNodeState, 0, len(remote))
+	for i := range remote {
+		if m.acceptRemoteState(&remote[i]) {
+			accepted = append(accepted, remote[i])
+		}
+	}
+	return accepted
+}
+
+// acceptRemoteState reports whether a remote snapshot entry is newer than,
+// or as new as, the local declaration for the same node key. The caller must
+// hold at least the read node lock. The rules mirror the recency checks of
+// aliveNode, suspectNode and deadNode so that an entry rejected here would
+// have been a no-op there.
+func (m *Memberlist) acceptRemoteState(r *pushNodeState) bool {
+	local, ok := m.nodeMap[r.Name]
+	if !ok {
+		// Only an alive declaration can introduce a node we have never
+		// seen; suspect, dead or left for an unknown node is a no-op.
+		return r.State == StateAlive
+	}
+	if r.Name == m.config.Name {
+		// Never regress our own declaration, but let current-or-newer
+		// claims about us through so that we can refute them.
+		return r.Incarnation >= local.Incarnation
+	}
+	if r.Incarnation < local.Incarnation {
+		// Strictly older than the local declaration: the remote view of
+		// this node is stale and must not move it in any direction.
+		return false
+	}
+	if r.State == StateAlive {
+		// An alive declaration only advances a node with a strictly newer
+		// incarnation, except when a dead or left node is being reclaimed
+		// (possibly under a new address), which the handler re-validates.
+		return r.Incarnation > local.Incarnation || local.DeadOrLeft()
+	}
+	// Suspect, dead or left at an equal-or-newer incarnation can still
+	// confirm a running suspicion timer or move the state machine forward.
+	return true
 }

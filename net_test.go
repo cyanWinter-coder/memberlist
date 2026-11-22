@@ -1160,3 +1160,158 @@ func (c *errorReadNetConn) Close() error {
 	close(c.closed)
 	return nil
 }
+
+func TestMembershipGeneration(t *testing.T) {
+	base := []pushNodeState{
+		{Name: "a", Incarnation: 1, State: StateAlive},
+		{Name: "b", Incarnation: 2, State: StateSuspect},
+	}
+
+	// Deterministic over the same snapshot.
+	require.Equal(t, membershipGeneration(base), membershipGeneration(base))
+	require.NotZero(t, membershipGeneration(base))
+
+	// Sensitive to incarnation bumps.
+	bumped := []pushNodeState{
+		{Name: "a", Incarnation: 1, State: StateAlive},
+		{Name: "b", Incarnation: 3, State: StateSuspect},
+	}
+	require.NotEqual(t, membershipGeneration(base), membershipGeneration(bumped))
+
+	// Sensitive to state changes at the same incarnation.
+	changed := []pushNodeState{
+		{Name: "a", Incarnation: 1, State: StateAlive},
+		{Name: "b", Incarnation: 2, State: StateDead},
+	}
+	require.NotEqual(t, membershipGeneration(base), membershipGeneration(changed))
+
+	// Sensitive to membership changes.
+	extended := append([]pushNodeState{}, base...)
+	extended = append(extended, pushNodeState{Name: "c", Incarnation: 1, State: StateAlive})
+	require.NotEqual(t, membershipGeneration(base), membershipGeneration(extended))
+}
+
+func TestSendLocalState_AdvertisesGeneration(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		c.EnableCompression = false
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a1 := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 3, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a1, nil, false)
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- m.sendLocalState(client, false, "")
+	}()
+
+	msgType, bufConn, dec, err := m.readStream(server, "")
+	require.NoError(t, err)
+	require.Equal(t, pushPullMsg, msgType)
+
+	header, nodes, _, err := m.readRemoteState(bufConn, dec)
+	require.NoError(t, err)
+	require.NoError(t, <-sendErr)
+
+	require.Equal(t, m.NumMembers(), header.Nodes)
+	// The advertised generation must describe the exact snapshot carried
+	// by this transfer.
+	require.Equal(t, membershipGeneration(nodes), header.Gen)
+}
+
+func TestReadRemoteState_GenerationWireCompat(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		c.EnableCompression = false
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// oldPushPullHeader is the header shape used by peers that predate the
+	// membership generation field.
+	type oldPushPullHeader struct {
+		Nodes        int
+		UserStateLen int
+		Join         bool
+	}
+
+	t.Run("old peer without generation", func(t *testing.T) {
+		var buf bytes.Buffer
+		hd := codec.MsgpackHandle{}
+		require.NoError(t, codec.NewEncoder(&buf, &hd).Encode(oldPushPullHeader{
+			Nodes: 0, UserStateLen: 0, Join: true,
+		}))
+
+		header, nodes, userState, err := m.readRemoteState(&buf, codec.NewDecoder(&buf, &hd))
+		require.NoError(t, err)
+		require.True(t, header.Join)
+		require.Zero(t, header.Gen, "peers without a generation must read as zero")
+		require.Empty(t, nodes)
+		require.Empty(t, userState)
+	})
+
+	t.Run("new peer generation ignored by old shape", func(t *testing.T) {
+		var buf bytes.Buffer
+		hd := codec.MsgpackHandle{}
+		require.NoError(t, codec.NewEncoder(&buf, &hd).Encode(pushPullHeader{
+			Nodes: 0, UserStateLen: 0, Join: true, Gen: 42,
+		}))
+
+		// Decoding with the old struct shape must not fail on the unknown
+		// generation field.
+		var old oldPushPullHeader
+		require.NoError(t, codec.NewDecoder(&buf, &hd).Decode(&old))
+		require.True(t, old.Join)
+	})
+}
+
+func TestSendAndReceiveState_ShutdownAbortsSync(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		// Long enough that only the shutdown path can unblock the sync.
+		c.TCPTimeout = 30 * time.Second
+	})
+
+	// A peer that accepts connections but never answers.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	syncErr := make(chan error, 1)
+	go func() {
+		_, err := m.sendAndReceiveState(Address{Addr: ln.Addr().String(), Name: "silent"}, false)
+		syncErr <- err
+	}()
+
+	// Let the sync connect and block waiting for the silent peer.
+	time.Sleep(200 * time.Millisecond)
+
+	start := time.Now()
+	require.NoError(t, m.Shutdown())
+	select {
+	case err := <-syncErr:
+		require.Error(t, err, "a sync aborted by shutdown must not report success")
+		require.Less(t, time.Since(start), 10*time.Second,
+			"shutdown must release the sync connection instead of waiting for the TCP timeout")
+	case <-time.After(15 * time.Second):
+		t.Fatal("sync was not aborted by shutdown")
+	}
+}

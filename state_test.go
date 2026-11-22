@@ -2661,3 +2661,229 @@ func verifySampleExists(t *testing.T, name string, sink *metrics.InmemSink) {
 		t.Fatalf("%s sample not emmited", name)
 	}
 }
+
+func TestMemberList_MergeState_StaleSnapshotRejected(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// A node we have confirmed alive at incarnation 5.
+	a := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 5, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+
+	queuedBefore := m.broadcasts.NumQueued()
+
+	// A stale remote view tries to move the node in every direction with
+	// strictly older incarnations. None of these may be applied.
+	remote := []pushNodeState{
+		{Name: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 4, State: StateSuspect},
+		{Name: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 3, State: StateDead},
+		{Name: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 4, State: StateLeft},
+		{Name: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 2, State: StateAlive},
+	}
+	m.mergeState(remote)
+
+	state := m.nodeMap["test1"]
+	require.Equal(t, StateAlive, state.State, "stale snapshot must not demote a confirmed alive node")
+	require.Equal(t, uint32(5), state.Incarnation)
+
+	// No suspicion timer may be started and nothing may be gossiped as a
+	// result of the rejected entries.
+	_, hasTimer := m.nodeTimers["test1"]
+	require.False(t, hasTimer, "stale suspect entry must not start a suspicion timer")
+	require.Equal(t, queuedBefore, m.broadcasts.NumQueued(), "stale entries must not trigger broadcasts")
+}
+
+func TestMemberList_MergeState_PerNodeKey(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a1 := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 5, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a1, nil, false)
+	a2 := alive{Node: "test2", Addr: []byte{127, 0, 0, 2}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a2, nil, false)
+
+	remote := []pushNodeState{
+		// Stale for test1: rejected, test1 must stay alive.
+		{Name: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 4, State: StateSuspect},
+		// Newer for test2: applied, test2 becomes suspect.
+		{Name: "test2", Addr: []byte{127, 0, 0, 2}, Incarnation: 2, State: StateSuspect},
+		// Unknown node with an alive declaration: introduced.
+		{Name: "test3", Addr: []byte{127, 0, 0, 3}, Incarnation: 1, State: StateAlive},
+		// Unknown node with a non-alive declaration: no-op.
+		{Name: "test4", Addr: []byte{127, 0, 0, 4}, Incarnation: 9, State: StateDead},
+	}
+	m.mergeState(remote)
+
+	state := m.nodeMap["test1"]
+	require.Equal(t, StateAlive, state.State)
+	require.Equal(t, uint32(5), state.Incarnation)
+
+	state = m.nodeMap["test2"]
+	require.Equal(t, StateSuspect, state.State)
+	require.Equal(t, uint32(2), state.Incarnation)
+
+	state = m.nodeMap["test3"]
+	require.NotNil(t, state)
+	require.Equal(t, StateAlive, state.State)
+
+	_, ok := m.nodeMap["test4"]
+	require.False(t, ok, "dead for an unknown node must not create an entry")
+}
+
+func TestMemberList_MergeState_Concurrent(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	const syncs = 8
+	const nodes = 16
+
+	for i := 0; i < nodes; i++ {
+		a := alive{
+			Node:        fmt.Sprintf("node%d", i),
+			Addr:        []byte{127, 0, 0, byte(i + 1)},
+			Incarnation: 1,
+			Vsn:         m.config.BuildVsnArray(),
+		}
+		m.aliveNode(&a, nil, false)
+	}
+
+	// Simulate many concurrent push/pull syncs merging overlapping remote
+	// snapshots. Each sync offers every node alive at its own incarnation;
+	// the per-node-key merge must converge every node to the highest
+	// incarnation offered, regardless of interleaving.
+	var wg sync.WaitGroup
+	for s := 0; s < syncs; s++ {
+		wg.Add(1)
+		go func(s int) {
+			defer wg.Done()
+			remote := make([]pushNodeState, 0, nodes)
+			for i := 0; i < nodes; i++ {
+				remote = append(remote, pushNodeState{
+					Name:        fmt.Sprintf("node%d", i),
+					Addr:        []byte{127, 0, 0, byte(i + 1)},
+					Incarnation: uint32(2 + s),
+					State:       StateAlive,
+				})
+			}
+			m.mergeState(remote)
+		}(s)
+	}
+	wg.Wait()
+
+	for i := 0; i < nodes; i++ {
+		state := m.nodeMap[fmt.Sprintf("node%d", i)]
+		require.Equal(t, StateAlive, state.State)
+		require.Equal(t, uint32(1+syncs), state.Incarnation, "node%d must converge to the newest incarnation", i)
+	}
+}
+
+func TestMemberList_MergeState_SelfSuspectRefuted(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// Bring the local node up so it has a declaration to defend.
+	require.NoError(t, m.setAlive())
+
+	self := m.nodeMap[m.config.Name]
+	require.NotNil(t, self)
+	before := self.Incarnation
+
+	// A remote snapshot accusing us at our current incarnation must still
+	// flow through the merge plan so that we can refute it.
+	remote := []pushNodeState{
+		{Name: m.config.Name, Addr: self.Addr, Port: self.Port, Incarnation: before, State: StateSuspect},
+	}
+	m.mergeState(remote)
+
+	self = m.nodeMap[m.config.Name]
+	require.Equal(t, StateAlive, self.State)
+	require.Greater(t, self.Incarnation, before, "self suspect claim must be refuted with a newer incarnation")
+}
+
+func TestMemberList_MergeRemoteState_ProtocolMismatchRollsBack(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a1 := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a1, nil, false)
+
+	frozenBefore := m.snapshotGenerations()
+
+	// A snapshot from a cluster speaking an incompatible protocol version:
+	// the merge must fail before any local state is touched.
+	remote := []pushNodeState{
+		{Name: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 99, State: StateSuspect, Vsn: []uint8{200, 201, 200, 0, 0, 0}},
+		{Name: "test9", Addr: []byte{127, 0, 0, 9}, Incarnation: 1, State: StateAlive, Vsn: []uint8{200, 201, 200, 0, 0, 0}},
+	}
+	err := m.mergeRemoteState(false, remote, nil)
+	require.Error(t, err)
+
+	require.Equal(t, frozenBefore, m.snapshotGenerations(), "a rejected snapshot must leave the local table untouched")
+	_, ok := m.nodeMap["test9"]
+	require.False(t, ok)
+}
+
+func TestMemberList_PushPullNode_FailureKeepsLocalState(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		// Keep the failure detector from interfering while the sync fails.
+		c.ProbeInterval = time.Hour
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a1 := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a1, nil, false)
+
+	frozenBefore := m.snapshotGenerations()
+
+	// The sync target refuses the connection; the failed sync must not
+	// change the local member table.
+	err := m.pushPullNode(Address{Addr: "127.0.0.1:1", Name: "unreachable"}, false)
+	require.Error(t, err)
+	require.Equal(t, frozenBefore, m.snapshotGenerations())
+}
+
+func TestMemberList_SnapshotGenerations_Frozen(t *testing.T) {
+	m := GetMemberlist(t, nil)
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	a1 := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a1, nil, false)
+
+	frozen := m.snapshotGenerations()
+	require.Contains(t, frozen, "test1")
+	require.Equal(t, nodeGeneration{Incarnation: 1, State: StateAlive}, frozen["test1"])
+
+	// The frozen view must not observe later local progress.
+	a2 := alive{Node: "test1", Addr: []byte{127, 0, 0, 1}, Incarnation: 7, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a2, nil, false)
+	require.Equal(t, uint32(1), frozen["test1"].Incarnation)
+	require.Equal(t, uint32(7), m.snapshotGenerations()["test1"].Incarnation)
+}
