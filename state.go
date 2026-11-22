@@ -1279,10 +1279,13 @@ func (m *Memberlist) deadNode(d *dead) {
 			return // Do not mark ourself dead
 		}
 
-		// If we are leaving, we broadcast and wait
-		m.encodeBroadcastNotify(d.Node, deadMsg, d, m.leaveBroadcast)
+		// If we are leaving, we broadcast and wait. Dead/left messages
+		// are terminal states: enqueue them as terminal broadcasts so a
+		// capacity eviction cannot drop the final state in favor of an
+		// earlier suspect.
+		m.encodeTerminalBroadcast(d.Node, deadMsg, d, m.leaveBroadcast)
 	} else {
-		m.encodeAndBroadcast(d.Node, deadMsg, d)
+		m.encodeTerminalBroadcast(d.Node, deadMsg, d, nil)
 	}
 
 	// Update metrics

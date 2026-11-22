@@ -19,6 +19,11 @@ type memberlistBroadcast struct {
 	node   string
 	msg    []byte
 	notify chan struct{}
+
+	// terminal marks a final state for the node (dead or left). Terminal
+	// broadcasts are protected from capacity eviction so an earlier
+	// suspect cannot outlive the dead state that superseded it.
+	terminal bool
 }
 
 func (b *memberlistBroadcast) Invalidates(other Broadcast) bool {
@@ -41,6 +46,12 @@ func (b *memberlistBroadcast) Message() []byte {
 	return b.msg
 }
 
+// Terminal reports whether this is a final node state that must be
+// retained ahead of intermediate states during queue eviction.
+func (b *memberlistBroadcast) Terminal() bool {
+	return b.terminal
+}
+
 func (b *memberlistBroadcast) Finished() {
 	select {
 	case b.notify <- struct{}{}:
@@ -54,6 +65,18 @@ func (m *Memberlist) encodeAndBroadcast(node string, msgType messageType, msg an
 	m.encodeBroadcastNotify(node, msgType, msg, nil)
 }
 
+// encodeTerminalBroadcast encodes a final-state message (dead or left) and
+// enqueues it as a terminal broadcast that is protected from capacity
+// eviction. Fails silently if there is an encoding error.
+func (m *Memberlist) encodeTerminalBroadcast(node string, msgType messageType, msg any, notify chan struct{}) {
+	buf, err := encode(msgType, msg, m.config.MsgpackUseNewTimeFormat)
+	if err != nil {
+		m.logger.Printf("[ERR] memberlist: Failed to encode message for broadcast: %s", err)
+	} else {
+		m.queueBroadcast(node, buf.Bytes(), notify, true)
+	}
+}
+
 // encodeBroadcastNotify encodes a message and enqueues it for broadcast
 // and notifies the given channel when transmission is finished. Fails
 // silently if there is an encoding error.
@@ -62,15 +85,16 @@ func (m *Memberlist) encodeBroadcastNotify(node string, msgType messageType, msg
 	if err != nil {
 		m.logger.Printf("[ERR] memberlist: Failed to encode message for broadcast: %s", err)
 	} else {
-		m.queueBroadcast(node, buf.Bytes(), notify)
+		m.queueBroadcast(node, buf.Bytes(), notify, false)
 	}
 }
 
 // queueBroadcast is used to start dissemination of a message. It will be
 // sent up to a configured number of times. The message could potentially
-// be invalidated by a future message about the same node
-func (m *Memberlist) queueBroadcast(node string, msg []byte, notify chan struct{}) {
-	b := &memberlistBroadcast{node, msg, notify}
+// be invalidated by a future message about the same node. Terminal messages
+// carry a final node state and are protected from capacity eviction.
+func (m *Memberlist) queueBroadcast(node string, msg []byte, notify chan struct{}, terminal bool) {
+	b := &memberlistBroadcast{node: node, msg: msg, notify: notify, terminal: terminal}
 	m.broadcasts.QueueBroadcast(b)
 }
 

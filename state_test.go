@@ -2661,3 +2661,74 @@ func verifySampleExists(t *testing.T, name string, sink *metrics.InmemSink) {
 		t.Fatalf("%s sample not emmited", name)
 	}
 }
+
+// TestMemberList_DeadNode_TerminalBroadcast is the end-to-end version of the
+// terminal-priority policy: a dead message produced through deadNode is
+// queued as a terminal broadcast, survives capacity eviction alongside
+// other nodes' intermediate states, and replaces that node's own earlier
+// intermediate message.
+func TestMemberList_DeadNode_TerminalBroadcast(t *testing.T) {
+	m := GetMemberlist(t, func(c *Config) {
+		c.MaxQueueSize = 3
+	})
+	defer func() {
+		if err := m.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// Two other nodes provide intermediate (alive) state that fills the
+	// capped queue.
+	for _, name := range []string{"peer1", "peer2"} {
+		a := alive{Node: name, Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+		m.aliveNode(&a, nil, false)
+	}
+
+	// The target goes alive, then dead. The dead broadcast must replace
+	// its alive message rather than coexist with it.
+	a := alive{Node: "test", Addr: []byte{127, 0, 0, 1}, Incarnation: 1, Vsn: m.config.BuildVsnArray()}
+	m.aliveNode(&a, nil, false)
+	require.Equal(t, 3, m.broadcasts.NumQueued())
+
+	state := m.nodeMap["test"]
+	state.StateChange = state.StateChange.Add(-time.Hour)
+	m.deadNode(&dead{Node: "test", Incarnation: 1})
+	require.Equal(t, 3, m.broadcasts.NumQueued(), "dead replaces the node's own alive message")
+
+	dump := m.broadcasts.orderedView()
+	var deadEntry *limitedBroadcast
+	for _, lb := range dump {
+		if messageType(lb.b.Message()[0]) == deadMsg {
+			deadEntry = lb
+		}
+	}
+	require.NotNil(t, deadEntry, "expected a queued dead message")
+	require.True(t, deadEntry.terminal, "dead message must be queued terminal")
+	require.Equal(t, "test", deadEntry.name)
+
+	// Fill the queue past capacity with more intermediate states. The
+	// dead entry is retained; only intermediate entries are evicted.
+	for i := 0; i < 5; i++ {
+		peer := alive{
+			Node:        fmt.Sprintf("filler%d", i),
+			Addr:        []byte{127, 0, 0, 1},
+			Port:        uint16(8100 + i),
+			Incarnation: 1,
+			Vsn:         m.config.BuildVsnArray(),
+		}
+		m.aliveNode(&peer, nil, false)
+	}
+
+	var stillHasDead bool
+	for _, lb := range m.broadcasts.orderedView() {
+		if messageType(lb.b.Message()[0]) == deadMsg {
+			stillHasDead = true
+			require.True(t, lb.terminal)
+		}
+	}
+	require.True(t, stillHasDead, "terminal dead state survived capacity eviction")
+	require.GreaterOrEqual(t, m.broadcasts.Stats().Evicted, int64(1), "intermediate states were evicted")
+	// The only same-node replacement is the dead message superseding
+	// "test"'s own alive message; every filler is a distinct node.
+	require.Equal(t, int64(1), m.broadcasts.Stats().Merged)
+}

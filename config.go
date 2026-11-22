@@ -78,6 +78,15 @@ type Config struct {
 	// at the expense of increased bandwidth.
 	RetransmitMult int
 
+	// MaxQueueSize caps the number of broadcasts retained for gossip
+	// retransmission. A value of zero (the default) leaves the queue
+	// unbounded and preserves the historical behavior. When the cap is
+	// reached, intermediate state messages (alive, suspect) are evicted
+	// before any terminal state message (dead, left), so a node's final
+	// state cannot be dropped while an earlier, stale intermediate state
+	// is retained.
+	MaxQueueSize int
+
 	// SuspicionMult is the multiplier for determining the time an
 	// inaccessible node is considered suspect before declaring it dead.
 	// The actual timeout is calculated using the formula:

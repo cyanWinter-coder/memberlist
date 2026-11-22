@@ -218,9 +218,12 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
-		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
-		logger:               logger,
-		metricLabels:         conf.MetricLabels,
+		broadcasts: &TransmitLimitedQueue{
+			RetransmitMult: conf.RetransmitMult,
+			MaxQueueSize:   conf.MaxQueueSize,
+		},
+		logger:       logger,
+		metricLabels: conf.MetricLabels,
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
@@ -749,6 +752,11 @@ func (m *Memberlist) Shutdown() error {
 	m.shutdown.Store(1)
 	close(m.shutdownCh)
 	m.deschedule()
+
+	// Drain the broadcast queue into its single terminal state so every
+	// in-flight broadcast's Finished callback runs exactly once and no
+	// further messages are accepted.
+	m.broadcasts.Close()
 	return nil
 }
 
