@@ -2425,3 +2425,98 @@ func runStep(t *testing.T, name string, fn func(t *testing.T)) {
 		t.FailNow()
 	}
 }
+
+// TestMemberlist_KeyRotation exercises a full key rotation across a live
+// cluster: both key generations decrypt in parallel during the window,
+// writes always use the current primary key, and the cluster keeps
+// converging after the old key is retired.
+func TestMemberlist_KeyRotation(t *testing.T) {
+	oldKey := TestKeys[0]
+	newKey := TestKeys[1]
+
+	newNode := func(t *testing.T, secret []byte, bindPort int) *Memberlist {
+		c := testConfig(t)
+		c.SecretKey = secret
+		c.BindPort = bindPort
+		c.GossipInterval = 20 * time.Millisecond
+		c.ProbeInterval = 50 * time.Millisecond
+		m, err := Create(c)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			if err := m.Shutdown(); err != nil {
+				t.Fatal(err)
+			}
+		})
+		return m
+	}
+
+	m1 := newNode(t, oldKey, 0)
+	bindPort := m1.config.BindPort
+	m2 := newNode(t, oldKey, bindPort)
+
+	num, err := m2.Join([]string{m1.config.Name + "/" + m1.config.BindAddr})
+	require.NoError(t, err)
+	require.Equal(t, 1, num)
+
+	// Phase 1: install the next-generation key everywhere. Writes still
+	// use the old primary; both generations already decrypt.
+	for _, m := range []*Memberlist{m1, m2} {
+		require.NoError(t, m.config.Keyring.AddKey(newKey))
+		require.Equal(t, KeyIDForKey(oldKey), mustPrimaryKeyID(t, m))
+	}
+
+	// Phase 2: flip the primary on one node only. The cluster is now
+	// mixed-generation: m1 writes with the new key, m2 with the old, and
+	// both directions must keep flowing.
+	require.NoError(t, m1.config.Keyring.UseKey(newKey))
+	require.NoError(t, m2.config.Keyring.UseKey(newKey))
+
+	// A node that only knows the new key can now join, proving writes
+	// happen with the new primary.
+	m3 := newNode(t, newKey, bindPort)
+	num, err = m3.Join([]string{m1.config.Name + "/" + m1.config.BindAddr})
+	require.NoError(t, err)
+	require.Equal(t, 1, num)
+
+	// Phase 3: retire the old key everywhere.
+	for _, m := range []*Memberlist{m1, m2} {
+		require.NoError(t, m.config.Keyring.RemoveKey(oldKey))
+		require.Equal(t, KeyIDForKey(newKey), mustPrimaryKeyID(t, m))
+	}
+
+	// The cluster must keep converging on probe/gossip traffic that is
+	// encrypted exclusively with the new key. If decryption leaked across
+	// generations or used the wrong key, nodes would suspect each other
+	// and the membership would shrink.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ok := true
+		for _, m := range []*Memberlist{m1, m2, m3} {
+			if m.NumMembers() != 3 {
+				ok = false
+			}
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cluster did not converge after rotation: %d %d %d",
+				m1.NumMembers(), m2.NumMembers(), m3.NumMembers())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Hold the converged state for a few probe rounds to make sure it is
+	// stable, not a snapshot taken before suspicion could kick in.
+	time.Sleep(300 * time.Millisecond)
+	for _, m := range []*Memberlist{m1, m2, m3} {
+		require.Equal(t, 3, m.NumMembers())
+	}
+}
+
+func mustPrimaryKeyID(t *testing.T, m *Memberlist) KeyID {
+	t.Helper()
+	id, ok := m.config.Keyring.GetPrimaryKeyID()
+	require.True(t, ok)
+	return id
+}

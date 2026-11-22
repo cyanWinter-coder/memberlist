@@ -985,10 +985,21 @@ func TestGossip_MismatchedKeys(t *testing.T) {
 		}
 	}()
 
-	// Make sure we get this error on the joining side
+	// Make sure we get this error on the joining side. The error must name
+	// the key generation (id) of the rejected message, and must not leak
+	// any key material. The joiner cannot decrypt the responder's error
+	// reply either, so the id it sees is the responder's key id.
 	_, err = m2.Join([]string{c1.Name + "/" + c1.BindAddr})
-	if err == nil || !strings.Contains(err.Error(), "no installed keys could decrypt the message") {
+	if err == nil || !strings.Contains(err.Error(), "no installed key matches key id") {
 		t.Fatalf("bad: %s", err)
+	}
+	wantID := KeyIDForKey(c1.SecretKey).String()
+	if !strings.Contains(err.Error(), wantID) {
+		t.Fatalf("error should name the unknown key id %s: %s", wantID, err)
+	}
+	if strings.Contains(err.Error(), string(c1.SecretKey)) ||
+		strings.Contains(err.Error(), string(c2.SecretKey)) {
+		t.Fatalf("error leaks key material: %s", err)
 	}
 }
 

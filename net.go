@@ -68,7 +68,7 @@ const (
 
 const (
 	// hasLabelMsg has a deliberately high value so that you can disambiguate
-	// it from the encryptionVersion header which is either 0/1 right now and
+	// it from the encryptionVersion header which is 0/1/2 right now and
 	// also any of the existing messageTypes
 	hasLabelMsg messageType = 244
 )
@@ -214,11 +214,15 @@ type msgHandoff struct {
 
 // encryptionVersion returns the encryption version to use
 func (m *Memberlist) encryptionVersion() encryptionVersion {
-	switch m.ProtocolVersion() {
-	case 1:
+	switch {
+	case m.ProtocolVersion() == 1:
 		return 0
-	default:
+	case m.config.DisableKeyVersionHeader:
+		// Legacy format for interop with nodes that predate key
+		// identifiers; see the config field documentation.
 		return 1
+	default:
+		return 2
 	}
 }
 

@@ -14,6 +14,11 @@ type Keyring struct {
 	// ordered in such a way where the first key (index 0) is the primary key,
 	// which is used for encrypting messages, and is the first key tried during
 	// message decryption.
+	//
+	// The slice is replaced wholesale on every update (copy-on-write) and
+	// never mutated in place, so a snapshot obtained via GetKeys stays
+	// consistent and usable while a rotation is in progress: readers finish
+	// decrypting with the old generation while writers install the new one.
 	keys [][]byte
 
 	// The keyring lock is used while performing IO operations on the keyring.
@@ -93,7 +98,14 @@ func (k *Keyring) AddKey(key []byte) error {
 		}
 	}
 
-	keys := append(k.keys, key)
+	// Build the new ring in a fresh slice; the old ring must stay untouched
+	// so that in-flight decryption snapshots are not corrupted. The update
+	// only becomes visible when installKeysLocked swaps the slice, so a
+	// failure anywhere before that point leaves the old ring in effect and
+	// the operation can simply be retried.
+	keys := make([][]byte, 0, len(k.keys)+1)
+	keys = append(keys, k.keys...)
+	keys = append(keys, key)
 	primaryKey := k.getPrimaryKeyLocked()
 	if primaryKey == nil {
 		primaryKey = key
@@ -127,7 +139,12 @@ func (k *Keyring) RemoveKey(key []byte) error {
 	}
 	for i, installedKey := range k.keys {
 		if bytes.Equal(key, installedKey) {
-			keys := append(k.keys[:i], k.keys[i+1:]...)
+			// Copy everything but the removed key into a fresh slice.
+			// Mutating k.keys in place here would corrupt snapshots that
+			// concurrent readers obtained via GetKeys.
+			keys := make([][]byte, 0, len(k.keys)-1)
+			keys = append(keys, k.keys[:i]...)
+			keys = append(keys, k.keys[i+1:]...)
 			k.installKeysLocked(keys, k.keys[0])
 		}
 	}
@@ -147,12 +164,16 @@ func (k *Keyring) installKeysLocked(keys [][]byte, primaryKey []byte) {
 	k.keys = newKeys
 }
 
-// GetKeys returns the current set of keys on the ring.
+// GetKeys returns the current set of keys on the ring. The returned slice
+// is a snapshot: it is a copy of the ring as of this call, it is not
+// affected by later rotations, and mutating it does not affect the ring.
 func (k *Keyring) GetKeys() [][]byte {
 	k.l.Lock()
 	defer k.l.Unlock()
 
-	return k.keys
+	keys := make([][]byte, len(k.keys))
+	copy(keys, k.keys)
+	return keys
 }
 
 // GetPrimaryKey returns the key on the ring at position 0. This is the key used
@@ -169,4 +190,46 @@ func (k *Keyring) getPrimaryKeyLocked() (key []byte) {
 		key = k.keys[0]
 	}
 	return
+}
+
+// GetKeyIDs returns the identifiers of the keys on the ring, in the same
+// order as GetKeys: index 0 is the primary key. Identifiers are safe to
+// log and are what version-2 messages carry to name their encrypting key,
+// which makes key generations visible while troubleshooting a rotation.
+func (k *Keyring) GetKeyIDs() []KeyID {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	ids := make([]KeyID, len(k.keys))
+	for i, key := range k.keys {
+		ids[i] = KeyIDForKey(key)
+	}
+	return ids
+}
+
+// GetPrimaryKeyID returns the identifier of the primary key, and false if
+// the ring is empty (encryption disabled).
+func (k *Keyring) GetPrimaryKeyID() (KeyID, bool) {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	if len(k.keys) == 0 {
+		return KeyID{}, false
+	}
+	return KeyIDForKey(k.keys[0]), true
+}
+
+// GetKeyByID returns the installed key with the given identifier, and false
+// if no installed key matches. It is used to select the exact key named by
+// an incoming version-2 message.
+func (k *Keyring) GetKeyByID(id KeyID) ([]byte, bool) {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	for _, key := range k.keys {
+		if KeyIDForKey(key) == id {
+			return key, true
+		}
+	}
+	return nil, false
 }

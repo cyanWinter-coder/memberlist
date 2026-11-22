@@ -137,6 +137,14 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		logger = log.New(logDest, "", log.LstdFlags)
 	}
 
+	// Surface the installed key generations so a rotation in progress is
+	// visible in the logs. Only the non-secret key identifiers are logged,
+	// never key material.
+	if conf.EncryptionEnabled() {
+		logger.Printf("[DEBUG] memberlist: keyring holds %d key(s), key ids: %v (first is primary)",
+			len(conf.Keyring.GetKeys()), conf.Keyring.GetKeyIDs())
+	}
+
 	// Set up a network transport by default if a custom one wasn't given
 	// by the config.
 	transport := conf.Transport

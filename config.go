@@ -193,6 +193,15 @@ type Config struct {
 	// automatically initialized using the SecretKey and SecretKeys values.
 	Keyring *Keyring
 
+	// DisableKeyVersionHeader forces outgoing messages to use the legacy
+	// encryption format (version 1) that does not name the encrypting key.
+	// Set this only while rolling a cluster that still runs nodes too old to
+	// understand key-versioned messages; those nodes reject the versioned
+	// format. Incoming messages are accepted in every supported format
+	// regardless of this setting, so the flag can be removed once all nodes
+	// support key identifiers.
+	DisableKeyVersionHeader bool
+
 	// Delegate and Events are delegates for receiving and providing
 	// data to memberlist via callback mechanisms. For Delegate, see
 	// the Delegate interface. For Events, see the EventDelegate interface.
