@@ -56,7 +56,64 @@ type NetTransport struct {
 	udpListeners []*net.UDPConn
 	shutdown     atomic.Int32
 
+	// closeCh is closed by Shutdown so that every stage of the transport -
+	// listener reads, handoff channel sends and dial/handshake waits - can
+	// observe shutdown and release its goroutine promptly.
+	closeCh chan struct{}
+
+	// activeConns tracks accepted and dialed TCP connections so Shutdown can
+	// close them, unblocking any in-flight read, write or handshake.
+	activeConns connSet
+
 	metricLabels []metrics.Label
+}
+
+// connSet tracks live net.Conn values behind a mutex.
+type connSet struct {
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+}
+
+func (s *connSet) add(conn net.Conn) {
+	s.mu.Lock()
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *connSet) remove(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+}
+
+// closeAll closes and clears every tracked connection.
+func (s *connSet) closeAll() {
+	s.mu.Lock()
+	conns := s.conns
+	s.conns = make(map[net.Conn]struct{})
+	s.mu.Unlock()
+
+	for conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// trackedConn wraps a net.Conn owned by the transport so that closing the
+// transport deregisters the connection exactly once even if the handler also
+// closes it at the end of its normal lifecycle.
+type trackedConn struct {
+	net.Conn
+	once    sync.Once
+	cleanup func()
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.cleanup)
+	return err
 }
 
 var _ NodeAwareTransport = (*NetTransport)(nil)
@@ -78,6 +135,7 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 		streamCh:     make(chan net.Conn),
 		logger:       config.Logger,
 		metricLabels: config.MetricLabels,
+		closeCh:      make(chan struct{}),
 	}
 
 	// Clean up listeners if there's an error.
@@ -232,10 +290,15 @@ func (t *NetTransport) IngestPacket(conn net.Conn, addr net.Addr, now time.Time,
 	}
 
 	// Inject the packet.
-	t.packetCh <- &Packet{
+	select {
+	case t.packetCh <- &Packet{
 		Buf:       buf.Bytes(),
 		From:      addr,
 		Timestamp: now,
+	}:
+	case <-t.closeCh:
+		// Transport is shutting down; drop the packet instead of blocking a
+		// goroutine on an unbuffered channel nobody is reading anymore.
 	}
 	return nil
 }
@@ -251,7 +314,24 @@ func (t *NetTransport) DialAddressTimeout(a Address, timeout time.Duration) (net
 	addr := a.Addr
 
 	dialer := net.Dialer{Timeout: timeout}
-	return dialer.Dial("tcp", addr)
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Track the dialed connection so that Shutdown during a subsequent
+	// handshake can interrupt it instead of leaving the goroutine blocked.
+	return t.trackConn(conn), nil
+}
+
+// trackConn registers conn for forced closure on Shutdown and returns a
+// wrapper that deregisters it on the first explicit Close.
+func (t *NetTransport) trackConn(conn net.Conn) net.Conn {
+	t.activeConns.add(conn)
+	return &trackedConn{
+		Conn:    conn,
+		cleanup: func() { t.activeConns.remove(conn) },
+	}
 }
 
 // See Transport.
@@ -261,7 +341,13 @@ func (t *NetTransport) StreamCh() <-chan net.Conn {
 
 // See IngestionAwareTransport.
 func (t *NetTransport) IngestStream(conn net.Conn) error {
-	t.streamCh <- conn
+	select {
+	case t.streamCh <- conn:
+	case <-t.closeCh:
+		// Nobody is consuming streams anymore; close the connection so the
+		// caller does not leak it.
+		_ = conn.Close()
+	}
 	return nil
 }
 
@@ -270,6 +356,17 @@ func (t *NetTransport) Shutdown() error {
 	// This will avoid log spam about errors when we shut down.
 	t.shutdown.Store(1)
 
+	// Signal shutdown to every stage that selects on closeCh (handoff sends,
+	// dial/handshake waits) and close in-flight connections. Closing the
+	// channel once is safe because Shutdown is serialized by callers and the
+	// atomic flag above makes repeated calls return through the same path.
+	select {
+	case <-t.closeCh:
+		// Already closed.
+	default:
+		close(t.closeCh)
+	}
+
 	// Rip through all the connections and shut them down.
 	for _, conn := range t.tcpListeners {
 		_ = conn.Close()
@@ -277,6 +374,10 @@ func (t *NetTransport) Shutdown() error {
 	for _, conn := range t.udpListeners {
 		_ = conn.Close()
 	}
+
+	// Close every tracked accepted/dialed connection so handlers blocked in
+	// reads, writes or protocol handshakes are interrupted.
+	t.activeConns.closeAll()
 
 	// Block until all the listener threads have died.
 	t.wg.Wait()
@@ -321,7 +422,21 @@ func (t *NetTransport) tcpListen(tcpLn *net.TCPListener) {
 		// No error, reset loop delay
 		loopDelay = 0
 
-		t.streamCh <- conn
+		// Track the connection so Shutdown can forcibly close it while a
+		// handler is blocked on a read or handshake. The wrapper deregisters
+		// the raw connection when it is normally closed.
+		tracked := t.trackConn(conn)
+
+		// Hand off without blocking forever: if Shutdown runs while the
+		// memberlist side is no longer consuming streams, close the
+		// connection and stop accepting instead of stranding this listener
+		// goroutine.
+		select {
+		case t.streamCh <- tracked:
+		case <-t.closeCh:
+			_ = tracked.Close()
+			return
+		}
 	}
 }
 
@@ -352,12 +467,18 @@ func (t *NetTransport) udpListen(udpLn *net.UDPConn) {
 			continue
 		}
 
-		// Ingest the packet.
+		// Ingest the packet. A select on closeCh ensures Shutdown cannot
+		// deadlock if the memberlist side stopped reading packetCh while a
+		// packet was being handed off.
 		metrics.IncrCounterWithLabels([]string{"memberlist", "udp", "received"}, float32(n), t.metricLabels)
-		t.packetCh <- &Packet{
+		select {
+		case t.packetCh <- &Packet{
 			Buf:       buf[:n],
 			From:      addr,
 			Timestamp: ts,
+		}:
+		case <-t.closeCh:
+			return
 		}
 	}
 }

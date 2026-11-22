@@ -9,8 +9,8 @@ import (
 )
 
 func TestMemberlistBroadcast_Invalidates(t *testing.T) {
-	m1 := &memberlistBroadcast{"test", nil, nil}
-	m2 := &memberlistBroadcast{"foo", nil, nil}
+	m1 := &memberlistBroadcast{node: "test", msg: nil, notify: nil}
+	m2 := &memberlistBroadcast{node: "foo", msg: nil, notify: nil}
 
 	if m1.Invalidates(m2) || m2.Invalidates(m1) {
 		t.Fatalf("unexpected invalidation")
@@ -22,7 +22,7 @@ func TestMemberlistBroadcast_Invalidates(t *testing.T) {
 }
 
 func TestMemberlistBroadcast_Message(t *testing.T) {
-	m1 := &memberlistBroadcast{"test", []byte("test"), nil}
+	m1 := &memberlistBroadcast{node: "test", msg: []byte("test"), notify: nil}
 	msg := m1.Message()
 	if !reflect.DeepEqual(msg, []byte("test")) {
 		t.Fatalf("messages do not match")

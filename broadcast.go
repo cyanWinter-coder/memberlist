@@ -70,7 +70,7 @@ func (m *Memberlist) encodeBroadcastNotify(node string, msgType messageType, msg
 // sent up to a configured number of times. The message could potentially
 // be invalidated by a future message about the same node
 func (m *Memberlist) queueBroadcast(node string, msg []byte, notify chan struct{}) {
-	b := &memberlistBroadcast{node, msg, notify}
+	b := &memberlistBroadcast{node: node, msg: msg, notify: notify}
 	m.broadcasts.QueueBroadcast(b)
 }
 

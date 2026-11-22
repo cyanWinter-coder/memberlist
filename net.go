@@ -210,6 +210,11 @@ type msgHandoff struct {
 	msgType messageType
 	buf     []byte
 	from    net.Addr
+
+	// gen is the connection generation under which this message entered the
+	// memberlist. Messages from a generation that is no longer current are
+	// discarded without mutating member state.
+	gen uint64
 }
 
 // encryptionVersion returns the encryption version to use
@@ -228,7 +233,17 @@ func (m *Memberlist) streamListen() {
 	for {
 		select {
 		case conn := <-m.transport.StreamCh():
-			go m.handleConn(conn)
+			// Stamp the connection with the generation under which it was
+			// accepted and track it so Shutdown can unblock it at any point,
+			// including the label/handshake reads below.
+			gen := m.generation.currentGeneration()
+			m.conns.add(conn)
+			m.streamWg.Add(1)
+			go func() {
+				defer m.streamWg.Done()
+				defer m.conns.remove(conn)
+				m.handleConn(conn, gen)
+			}()
 
 		case <-m.shutdownCh:
 			return
@@ -237,7 +252,9 @@ func (m *Memberlist) streamListen() {
 }
 
 // handleConn handles a single incoming stream connection from the transport.
-func (m *Memberlist) handleConn(conn net.Conn) {
+// The gen argument is the connection generation captured when the stream was
+// accepted; state changes are only applied if that generation is still current.
+func (m *Memberlist) handleConn(conn net.Conn, gen uint64) {
 	m.logger.Printf("[DEBUG] memberlist: Stream connection %s", LogConn(conn))
 
 	metrics.IncrCounterWithLabels([]string{"memberlist", "tcp", "accept"}, 1, m.metricLabels)
@@ -278,6 +295,11 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 		m.logger.Printf("[ERR] memberlist: discarding stream with unacceptable label %q: %s", streamLabel, LogConn(conn))
 		return
 	}
+
+	// A generation boundary (successful re-join) may have been crossed while
+	// the connection was waiting in the handshake. Stale streams may still
+	// complete their cleanup; they must never apply state updates.
+	staleStream := m.generation.isStale(gen)
 
 	msgType, bufConn, dec, err := m.readStream(conn, streamLabel)
 	if err != nil {
@@ -324,6 +346,16 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 
 		if err := m.sendLocalState(conn, join, streamLabel); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to push local state: %s %s", err, LogConn(conn))
+			return
+		}
+
+		// Re-check under the lock-free helper right before applying state: a
+		// concurrent (re-)join may have advanced the generation while the
+		// remote state was being read. Such a merge must not touch the member
+		// table or emit join/leave/update events.
+		if staleStream || m.generation.isStale(gen) {
+			m.logger.Printf("[WARN] memberlist: discarding push/pull state from stale connection generation %d (current %d) %s",
+				gen, m.generation.currentGeneration(), LogConn(conn))
 			return
 		}
 
@@ -470,12 +502,17 @@ func (m *Memberlist) handleCommand(buf []byte, from net.Addr, timestamp time.Tim
 			queue = m.highPriorityMsgQueue
 		}
 
+		// Stamp the message with the generation under which it arrived. A
+		// generation bump before the packetHandler dequeues it causes the
+		// stale message to be dropped without touching member state.
+		handoff := msgHandoff{msgType: msgType, buf: buf, from: from, gen: m.generation.currentGeneration()}
+
 		// Check for overflow and append if not full
 		m.msgQueueLock.Lock()
 		if queue.Len() >= m.config.HandoffQueueDepth {
 			m.logger.Printf("[WARN] memberlist: handler queue full, dropping message (%d) %s", msgType, LogAddress(from))
 		} else {
-			queue.PushBack(msgHandoff{msgType, buf, from})
+			queue.PushBack(handoff)
 		}
 		m.msgQueueLock.Unlock()
 
@@ -522,6 +559,15 @@ func (m *Memberlist) packetHandler() {
 				msgType := msg.msgType
 				buf := msg.buf
 				from := msg.from
+
+				// Discard anything queued by a superseded connection
+				// generation; only current-generation updates may reach the
+				// member table and event delegates.
+				if m.generation.isStale(msg.gen) {
+					m.logger.Printf("[DEBUG] memberlist: dropping stale generation (%d < %d) message (%d) %s",
+						msg.gen, m.generation.currentGeneration(), msgType, LogAddress(from))
+					continue
+				}
 
 				switch msgType {
 				case suspectMsg:

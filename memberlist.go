@@ -56,6 +56,17 @@ type Memberlist struct {
 
 	shutdownLock sync.Mutex // Serializes calls to Shutdown
 	leaveLock    sync.Mutex // Serializes calls to Leave
+	joinLock     sync.Mutex // Serializes (re-)joins and their generation bumps
+
+	// generation identifies the current communication generation. Every
+	// successful Join advances it; communication from older generations is
+	// prevented from mutating member state.
+	generation *connectionGeneration
+
+	// conns tracks inbound stream connections handed to handleConn so that
+	// Shutdown can unblock any handler stuck in a read, write or handshake.
+	conns    *connRegistry
+	streamWg sync.WaitGroup
 
 	transport NodeAwareTransport
 
@@ -221,6 +232,8 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
 		logger:               logger,
 		metricLabels:         conf.MetricLabels,
+		generation:           newConnectionGeneration(),
+		conns:                newConnRegistry(),
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
@@ -268,6 +281,12 @@ func Create(conf *Config) (*Memberlist, error) {
 // none could be reached. If an error is returned, the node did not successfully
 // join the cluster.
 func (m *Memberlist) Join(existing []string) (int, error) {
+	// Serialize joins so that concurrent (re-)joins cannot interleave their
+	// state exchanges and generation bumps. Communication from an earlier
+	// generation can never be accepted as an update for a later one.
+	m.joinLock.Lock()
+	defer m.joinLock.Unlock()
+
 	numSuccess := 0
 	var errs error
 	for _, exist := range existing {
@@ -294,8 +313,43 @@ func (m *Memberlist) Join(existing []string) (int, error) {
 	}
 	if numSuccess > 0 {
 		errs = nil
+		// Commit a new generation only after at least one peer was reached:
+		// flush queued inbound state messages belonging to earlier generations
+		// so delayed messages from the pre-restart instance can only complete
+		// cleanup and can never mutate the new instance's member table.
+		newGen := m.generation.bump()
+		m.advanceGeneration(newGen)
 	}
 	return numSuccess, errs
+}
+
+// advanceGeneration commits newGen as the active communication generation by
+// discarding every queued inbound handoff message stamped with an older
+// generation. It is a no-op if another join has already advanced past newGen.
+// Outbound broadcasts are deliberately not generation-scoped: peers maintain
+// their own generation counters and an outbound alive/suspect/dead must still
+// reach them; the inbound gating on each peer decides what may be applied.
+func (m *Memberlist) advanceGeneration(newGen uint64) {
+	if m.generation.isStale(newGen) {
+		return
+	}
+
+	// Handoff queues feed the single packetHandler, so msgQueueLock also
+	// guards their generation transition.
+	m.msgQueueLock.Lock()
+	for e := m.highPriorityMsgQueue.Front(); e != nil; e = e.Next() {
+		h := e.Value.(msgHandoff)
+		if h.gen < newGen {
+			m.highPriorityMsgQueue.Remove(e)
+		}
+	}
+	for e := m.lowPriorityMsgQueue.Front(); e != nil; e = e.Next() {
+		h := e.Value.(msgHandoff)
+		if h.gen < newGen {
+			m.lowPriorityMsgQueue.Remove(e)
+		}
+	}
+	m.msgQueueLock.Unlock()
 }
 
 // ipPort holds information about a node we want to try to join.
@@ -745,10 +799,19 @@ func (m *Memberlist) Shutdown() error {
 		m.logger.Printf("[ERR] Failed to shutdown transport: %v", err)
 	}
 
+	// Close any inbound stream connections whose handler goroutines are still
+	// blocked in a read, write or handshake (for example when the transport
+	// does not own the connection lifecycle, as with the mock transport).
+	m.conns.closeAll()
+
 	// Now tear down everything else.
 	m.shutdown.Store(1)
 	close(m.shutdownCh)
 	m.deschedule()
+
+	// Wait for every stream handler to exit so Shutdown leaves no goroutines
+	// behind, including connections accepted immediately before shutdown.
+	m.streamWg.Wait()
 	return nil
 }
 
