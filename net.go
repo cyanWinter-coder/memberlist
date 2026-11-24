@@ -701,6 +701,9 @@ func (m *Memberlist) handleSuspect(buf []byte, from net.Addr) {
 		m.logger.Printf("[ERR] memberlist: Failed to decode suspect message: %s %s", err, LogAddress(from))
 		return
 	}
+	// The peer relaying this suspect has received our broadcast about the
+	// same node, which counts as an acknowledgement.
+	m.ackBroadcast(sus.Node, m.nodeNameByAddr(from))
 	m.suspectNode(&sus)
 }
 
@@ -736,6 +739,9 @@ func (m *Memberlist) handleAlive(buf []byte, from net.Addr) {
 		m.logger.Printf("[ERR] memberlist: Failed to decode alive message: %s %s", err, LogAddress(from))
 		return
 	}
+	// An alive message echoed by a peer means our earlier broadcast reached
+	// it and can be marked as acknowledged.
+	m.ackBroadcast(live.Node, m.nodeNameByAddr(from))
 	if m.config.IPMustBeChecked() {
 		innerIP := net.IP(live.Addr)
 		if innerIP != nil {
@@ -761,6 +767,8 @@ func (m *Memberlist) handleDead(buf []byte, from net.Addr) {
 		m.logger.Printf("[ERR] memberlist: Failed to decode dead message: %s %s", err, LogAddress(from))
 		return
 	}
+	// The relaying peer has received our dead broadcast for this node.
+	m.ackBroadcast(d.Node, m.nodeNameByAddr(from))
 	m.deadNode(&d)
 }
 

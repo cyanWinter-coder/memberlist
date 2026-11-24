@@ -73,9 +73,9 @@ func TestLimitedBroadcastLess(t *testing.T) {
 
 func TestTransmitLimited_Queue(t *testing.T) {
 	q := &TransmitLimitedQueue{RetransmitMult: 1, NumNodes: func() int { return 1 }}
-	q.QueueBroadcast(&memberlistBroadcast{"test", nil, nil})
-	q.QueueBroadcast(&memberlistBroadcast{"foo", nil, nil})
-	q.QueueBroadcast(&memberlistBroadcast{"bar", nil, nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "test", msg: nil, notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "foo", msg: nil, notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "bar", msg: nil, notify: nil})
 
 	if q.NumQueued() != 3 {
 		t.Fatalf("bad len")
@@ -92,7 +92,7 @@ func TestTransmitLimited_Queue(t *testing.T) {
 	}
 
 	// Should invalidate previous message
-	q.QueueBroadcast(&memberlistBroadcast{"test", nil, nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "test", msg: nil, notify: nil})
 
 	if q.NumQueued() != 3 {
 		t.Fatalf("bad len")
@@ -113,10 +113,10 @@ func TestTransmitLimited_GetBroadcasts(t *testing.T) {
 	q := &TransmitLimitedQueue{RetransmitMult: 3, NumNodes: func() int { return 10 }}
 
 	// 18 bytes per message
-	q.QueueBroadcast(&memberlistBroadcast{"test", []byte("1. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"foo", []byte("2. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"bar", []byte("3. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"baz", []byte("4. this is a test."), nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "test", msg: []byte("1. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "foo", msg: []byte("2. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "bar", msg: []byte("3. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "baz", msg: []byte("4. this is a test."), notify: nil})
 
 	// 2 byte overhead per message, should get all 4 messages
 	all := q.GetBroadcasts(2, 80)
@@ -134,10 +134,10 @@ func TestTransmitLimited_GetBroadcasts_Limit(t *testing.T) {
 	require.Equal(t, 2, retransmitLimit(q.RetransmitMult, q.NumNodes()), "sanity check transmit limits")
 
 	// 18 bytes per message
-	q.QueueBroadcast(&memberlistBroadcast{"test", []byte("1. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"foo", []byte("2. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"bar", []byte("3. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"baz", []byte("4. this is a test."), nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "test", msg: []byte("1. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "foo", msg: []byte("2. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "bar", msg: []byte("3. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "baz", msg: []byte("4. this is a test."), notify: nil})
 
 	require.Equal(t, int64(4), q.idGen, "we handed out 4 IDs")
 
@@ -180,10 +180,10 @@ func TestTransmitLimited_Prune(t *testing.T) {
 	ch2 := make(chan struct{}, 1)
 
 	// 18 bytes per message
-	q.QueueBroadcast(&memberlistBroadcast{"test", []byte("1. this is a test."), ch1})
-	q.QueueBroadcast(&memberlistBroadcast{"foo", []byte("2. this is a test."), ch2})
-	q.QueueBroadcast(&memberlistBroadcast{"bar", []byte("3. this is a test."), nil})
-	q.QueueBroadcast(&memberlistBroadcast{"baz", []byte("4. this is a test."), nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "test", msg: []byte("1. this is a test."), notify: ch1})
+	q.QueueBroadcast(&memberlistBroadcast{node: "foo", msg: []byte("2. this is a test."), notify: ch2})
+	q.QueueBroadcast(&memberlistBroadcast{node: "bar", msg: []byte("3. this is a test."), notify: nil})
+	q.QueueBroadcast(&memberlistBroadcast{node: "baz", msg: []byte("4. this is a test."), notify: nil})
 
 	// Keep only 2
 	q.Prune(2)
@@ -216,7 +216,7 @@ func TestTransmitLimited_ordering(t *testing.T) {
 	q := &TransmitLimitedQueue{RetransmitMult: 1, NumNodes: func() int { return 10 }}
 
 	insert := func(name string, transmits int) {
-		q.queueBroadcast(&memberlistBroadcast{name, []byte(name), make(chan struct{})}, transmits)
+		q.queueBroadcast(&memberlistBroadcast{node: name, msg: []byte(name), notify: make(chan struct{})}, transmits)
 	}
 
 	insert("node0", 0)

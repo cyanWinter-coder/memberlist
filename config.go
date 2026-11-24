@@ -261,6 +261,32 @@ type Config struct {
 	// queue to apply the warning and max depth.
 	QueueCheckInterval time.Duration
 
+	// BroadcastTTL is the validity period of a queued broadcast message.
+	// Entries that have not been disseminated before the TTL elapses are
+	// removed from the queue and counted as expired, preventing stale
+	// messages from accumulating and being retransmitted. A value of zero
+	// disables expiry and preserves the historical behavior.
+	BroadcastTTL time.Duration
+
+	// MaxBroadcastQueue bounds the number of messages held by the broadcast
+	// queue. When the bound is reached the stalest entries (highest
+	// retransmit count, then oldest) are evicted to make room and counted as
+	// overflow. A value of zero leaves the queue unbounded.
+	MaxBroadcastQueue int
+
+	// EnableGossipAck, when true, tracks the destination set of each
+	// broadcast and releases it as soon as every target has relayed the
+	// corresponding state change (see TransmitLimitedQueue.AckBroadcast),
+	// instead of waiting for the retransmit limit.
+	//
+	// This is off by default because gossip has no explicit
+	// acknowledgement: a peer relaying a state change may have learned it
+	// from a third party rather than from this node, so treating every
+	// relay as an ack is a heuristic that can trade propagation margin for
+	// queue turnover. Leave it disabled unless the workload benefits from
+	// aggressively freeing acknowledged entries.
+	EnableGossipAck bool
+
 	// MsgpackUseNewTimeFormat when set to true, force the underlying msgpack
 	// codec to use the new format of time.Time when encoding (used in
 	// go-msgpack v1.1.5 by default). Decoding is not affected, as all
@@ -337,6 +363,12 @@ func DefaultLANConfig() *Config {
 		CIDRsAllowed:      nil, // same as allow all
 
 		QueueCheckInterval: 30 * time.Second,
+
+		// Bound the broadcast queue so a burst of state changes cannot
+		// grow it without limit; 30s comfortably covers the retransmit
+		// schedule of a 200-node cluster at the default gossip interval.
+		BroadcastTTL:      30 * time.Second,
+		MaxBroadcastQueue: 4096,
 	}
 }
 

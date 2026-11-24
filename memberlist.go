@@ -218,9 +218,13 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
-		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
-		logger:               logger,
-		metricLabels:         conf.MetricLabels,
+		broadcasts: &TransmitLimitedQueue{
+			RetransmitMult: conf.RetransmitMult,
+			MaxLen:         conf.MaxBroadcastQueue,
+			Logger:         logger,
+		},
+		logger:       logger,
+		metricLabels: conf.MetricLabels,
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
@@ -787,11 +791,22 @@ func (m *Memberlist) changeNode(addr string, f func(*nodeState)) {
 // checkBroadcastQueueDepth periodically checks the size of the broadcast queue
 // to see if it is too large
 func (m *Memberlist) checkBroadcastQueueDepth() {
+	// Snapshot of the queue's cumulative drop counters as of the previous
+	// tick, so each interval only reports the increment.
+	var prevExpired, prevOverflow, prevAckReleased int64
 	for {
 		select {
 		case <-time.After(m.config.QueueCheckInterval):
 			numq := m.broadcasts.NumQueued()
 			metrics.AddSampleWithLabels([]string{"memberlist", "queue", "broadcasts"}, float32(numq), m.metricLabels)
+
+			expired := m.broadcasts.NumExpired()
+			overflow := m.broadcasts.NumOverflow()
+			ackReleased := m.broadcasts.NumAckReleased()
+			metrics.IncrCounterWithLabels([]string{"memberlist", "queue", "expired"}, float32(expired-prevExpired), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "queue", "overflow"}, float32(overflow-prevOverflow), m.metricLabels)
+			metrics.IncrCounterWithLabels([]string{"memberlist", "queue", "ack_released"}, float32(ackReleased-prevAckReleased), m.metricLabels)
+			prevExpired, prevOverflow, prevAckReleased = expired, overflow, ackReleased
 		case <-m.shutdownCh:
 			return
 		}

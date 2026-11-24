@@ -4,8 +4,10 @@
 package memberlist
 
 import (
+	"log"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/google/btree"
 )
@@ -24,10 +26,29 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
+	// MaxLen is the maximum number of messages the queue will hold. When
+	// the queue is full the oldest entries are dropped to make room. A
+	// value of zero disables the bound and preserves the historical
+	// unbounded behavior.
+	MaxLen int
+
+	// Logger is used to log expired and overflow-dropped broadcasts. It
+	// may be nil, in which case drops are only visible through the
+	// counters.
+	Logger *log.Logger
+
+	// Now returns the time used for TTL evaluation. It defaults to
+	// time.Now and is mainly a seam for testing.
+	Now func() time.Time
+
 	mu    sync.Mutex
 	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
 	tm    map[string]*limitedBroadcast
 	idGen int64
+
+	expiredCount  int64 // number of entries removed because their TTL elapsed
+	overflowCount int64 // number of entries evicted to respect MaxLen
+	ackReleased   int64 // number of entries released after full acknowledgement
 }
 
 type limitedBroadcast struct {
@@ -37,6 +58,12 @@ type limitedBroadcast struct {
 	b         Broadcast
 
 	name string // set if Broadcast is a NamedBroadcast
+
+	expiresAt time.Time // zero value means the entry never expires
+	// pending holds the targets that have not acknowledged the message yet.
+	// A nil map means no explicit target tracking; the entry is released via
+	// the retransmit limit instead.
+	pending map[string]struct{}
 }
 
 // Less tests whether the current item is less than the given argument.
@@ -149,6 +176,30 @@ type UniqueBroadcast interface {
 	UniqueBroadcast()
 }
 
+// BroadcastTTL is an optional extension of the Broadcast interface that
+// supplies a validity period. Once the TTL elapses the entry is removed
+// from the queue on the next enqueue or GetBroadcasts call and counted as
+// an expired broadcast, so stale messages stop consuming queue space and
+// retransmission budget.
+type BroadcastTTL interface {
+	Broadcast
+	// BroadcastTTL returns how long the broadcast remains valid starting
+	// from the moment it is enqueued.
+	BroadcastTTL() time.Duration
+}
+
+// BroadcastTarget is an optional extension of the Broadcast interface that
+// names the nodes which must receive the message. When every target has
+// acknowledged it via TransmitLimitedQueue.AckBroadcast the entry is
+// released immediately, without waiting for the retransmit limit.
+type BroadcastTarget interface {
+	Broadcast
+	// BroadcastTargets returns the names of the destination nodes. The
+	// returned slice is copied at enqueue time and may be empty, in which
+	// case the entry falls back to retransmit-limit release.
+	BroadcastTargets() []string
+}
+
 // QueueBroadcast is used to enqueue a broadcast
 func (q *TransmitLimitedQueue) QueueBroadcast(b Broadcast) {
 	q.queueBroadcast(b, 0)
@@ -163,6 +214,18 @@ func (q *TransmitLimitedQueue) lazyInit() {
 	if q.tm == nil {
 		q.tm = make(map[string]*limitedBroadcast)
 	}
+	if q.Now == nil {
+		q.Now = time.Now
+	}
+}
+
+// nowLocked returns the current clock, lazily initialized so that queues
+// constructed without the Now seam keep working. You must hold the mutex.
+func (q *TransmitLimitedQueue) nowLocked() time.Time {
+	if q.Now == nil {
+		return time.Now()
+	}
+	return q.Now()
 }
 
 // queueBroadcast is like QueueBroadcast but you can use a nonzero value for
@@ -173,6 +236,11 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 	defer q.mu.Unlock()
 
 	q.lazyInit()
+	now := q.nowLocked()
+
+	// Drop any entries whose validity period has elapsed before doing any
+	// work; this keeps expired messages out of the btree and the map.
+	q.pruneExpiredLocked(now)
 
 	if q.idGen == math.MaxInt64 {
 		// it's super duper unlikely to wrap around within the retransmit limit
@@ -193,6 +261,19 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 		lb.name = nb.Name()
 	} else if _, ok := b.(UniqueBroadcast); ok {
 		unique = true
+	}
+	if tb, ok := b.(BroadcastTTL); ok {
+		if ttl := tb.BroadcastTTL(); ttl > 0 {
+			lb.expiresAt = now.Add(ttl)
+		}
+	}
+	if tb, ok := b.(BroadcastTarget); ok {
+		if targets := tb.BroadcastTargets(); len(targets) > 0 {
+			lb.pending = make(map[string]struct{}, len(targets))
+			for _, target := range targets {
+				lb.pending[target] = struct{}{}
+			}
+		}
 	}
 
 	// Check if this message invalidates another.
@@ -226,6 +307,11 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 		}
 	}
 
+	// Enforce the capacity bound before inserting so the queue never
+	// exceeds MaxLen. The btree Max is the entry with the highest transmit
+	// count and, within a tier, the oldest id, i.e. the stalest message.
+	q.enforceMaxLenLocked()
+
 	// Append to the relevant queue.
 	q.addItem(lb)
 }
@@ -254,6 +340,64 @@ func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
 	}
 }
 
+// pruneExpiredLocked removes every entry whose TTL has elapsed, invokes
+// Finished on its broadcast and bumps the expired counter. You must hold
+// the mutex.
+func (q *TransmitLimitedQueue) pruneExpiredLocked(now time.Time) {
+	if q.lenLocked() == 0 {
+		return
+	}
+	var expired []*limitedBroadcast
+	q.walkReadOnlyLocked(false, func(cur *limitedBroadcast) bool {
+		if !cur.expiresAt.IsZero() && !now.Before(cur.expiresAt) {
+			expired = append(expired, cur)
+		}
+		return true
+	})
+	for _, cur := range expired {
+		if q.Logger != nil {
+			q.Logger.Printf("[WARN] memberlist: broadcast for %q expired %s ago, dropping", q.broadcastName(cur), now.Sub(cur.expiresAt).Round(time.Millisecond))
+		}
+		cur.b.Finished()
+		q.deleteItem(cur)
+		q.expiredCount++
+	}
+}
+
+// enforceMaxLenLocked drops the stalest entries (highest transmit count,
+// then oldest id) until the queue is below MaxLen, invokes Finished on the
+// evicted broadcasts and bumps the overflow counter. A MaxLen of zero means
+// no bound is enforced. You must hold the mutex.
+func (q *TransmitLimitedQueue) enforceMaxLenLocked() {
+	if q.MaxLen <= 0 {
+		return
+	}
+	for q.lenLocked() >= q.MaxLen {
+		item := q.tq.Max()
+		if item == nil {
+			return
+		}
+		cur := item.(*limitedBroadcast)
+		if q.Logger != nil {
+			q.Logger.Printf("[WARN] memberlist: broadcast queue full (%d), dropping oldest entry for %q", q.MaxLen, q.broadcastName(cur))
+		}
+		cur.b.Finished()
+		q.deleteItem(cur)
+		q.overflowCount++
+	}
+}
+
+// broadcastName returns a human readable identity for log messages.
+func (q *TransmitLimitedQueue) broadcastName(cur *limitedBroadcast) string {
+	if cur.name != "" {
+		return cur.name
+	}
+	if nb, ok := cur.b.(NamedBroadcast); ok {
+		return nb.Name()
+	}
+	return "anonymous"
+}
+
 // getTransmitRange returns a pair of min/max values for transmit values
 // represented by the current queue contents. Both values represent actual
 // transmit values on the interval [0, len). You must already hold the mutex.
@@ -279,6 +423,12 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 	defer q.mu.Unlock()
 
 	// Fast path the default case
+	if q.lenLocked() == 0 {
+		return nil
+	}
+
+	// Expired entries must never be handed out again.
+	q.pruneExpiredLocked(q.nowLocked())
 	if q.lenLocked() == 0 {
 		return nil
 	}
@@ -368,6 +518,65 @@ func (q *TransmitLimitedQueue) NumQueued() int {
 	return q.lenLocked()
 }
 
+// AckBroadcast records that target has acknowledged the named broadcast.
+// Once every target supplied at enqueue time has acknowledged, the entry is
+// released immediately (Finished is invoked and the slot is freed) instead
+// of waiting for the retransmit limit. It returns true when the
+// acknowledgement caused the entry to be released. Broadcasts without
+// tracked targets (non-named entries or entries enqueued without targets)
+// are ignored and report false.
+func (q *TransmitLimitedQueue) AckBroadcast(name, target string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.tm == nil {
+		return false
+	}
+	cur, ok := q.tm[name]
+	if !ok || cur.pending == nil {
+		return false
+	}
+	if _, ok := cur.pending[target]; !ok {
+		return false
+	}
+	delete(cur.pending, target)
+	if len(cur.pending) != 0 {
+		return false
+	}
+
+	if q.Logger != nil {
+		q.Logger.Printf("[DEBUG] memberlist: broadcast %q acknowledged by all targets, releasing", name)
+	}
+	cur.b.Finished()
+	q.deleteItem(cur)
+	q.ackReleased++
+	return true
+}
+
+// NumExpired returns the total number of broadcasts removed because their
+// TTL elapsed.
+func (q *TransmitLimitedQueue) NumExpired() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.expiredCount
+}
+
+// NumOverflow returns the total number of broadcasts evicted to respect
+// MaxLen.
+func (q *TransmitLimitedQueue) NumOverflow() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.overflowCount
+}
+
+// NumAckReleased returns the total number of broadcasts released once all
+// their targets had acknowledged.
+func (q *TransmitLimitedQueue) NumAckReleased() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.ackReleased
+}
+
 // lenLocked returns the length of the overall queue datastructure. You must
 // hold the mutex.
 func (q *TransmitLimitedQueue) lenLocked() int {
@@ -390,6 +599,9 @@ func (q *TransmitLimitedQueue) Reset() {
 	q.tq = nil
 	q.tm = nil
 	q.idGen = 0
+	q.expiredCount = 0
+	q.overflowCount = 0
+	q.ackReleased = 0
 }
 
 // Prune will retain the maxRetain latest messages, and the rest
@@ -407,5 +619,6 @@ func (q *TransmitLimitedQueue) Prune(maxRetain int) {
 		cur := item.(*limitedBroadcast)
 		cur.b.Finished()
 		q.deleteItem(cur)
+		q.overflowCount++
 	}
 }
