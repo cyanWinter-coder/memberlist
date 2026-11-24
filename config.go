@@ -136,6 +136,17 @@ type Config struct {
 	// indirect UDP pings.
 	DisableTcpPings bool
 
+	// EnableTCPFallback allows packets larger than UDPBufferSize to be sent
+	// over the reliable stream transport instead of emitting a UDP datagram
+	// that may exceed the path MTU. When unset, oversized packet writes also
+	// use TCP while DisableTcpPings is false.
+	EnableTCPFallback bool
+
+	// TCPFallback and FallbackToTCP are spelling aliases for
+	// EnableTCPFallback.
+	TCPFallback   bool
+	FallbackToTCP bool
+
 	// DisableTcpPingsForNode is like DisableTcpPings, but lets you control
 	// whether to perform TCP pings on a node-by-node basis.
 	DisableTcpPingsForNode func(nodeName string) bool
@@ -240,6 +251,13 @@ type Config struct {
 	// called PacketBufferSize now that we have generalized the transport.
 	UDPBufferSize int
 
+	// PacketBufferSize, MaxUDPPacketSize and MaxPacketSize are optional
+	// aliases for UDPBufferSize. They make the MTU cap explicit while
+	// preserving the historical field name.
+	PacketBufferSize int
+	MaxUDPPacketSize int
+	MaxPacketSize    int
+
 	// DeadNodeReclaimTime controls the time before a dead node's name can be
 	// reclaimed by one with a different address or port. By default, this is 0,
 	// meaning nodes cannot be reclaimed this way.
@@ -266,6 +284,22 @@ type Config struct {
 	// go-msgpack v1.1.5 by default). Decoding is not affected, as all
 	// go-msgpack v2.1.0+ decoders know how to decode both formats.
 	MsgpackUseNewTimeFormat bool
+}
+
+// configuredUDPPacketSize returns the configured UDP payload cap, accepting
+// both the historical UDPBufferSize name and the explicit MTU aliases.
+func (c *Config) configuredUDPPacketSize() int {
+	for _, n := range []int{c.UDPBufferSize, c.PacketBufferSize, c.MaxUDPPacketSize, c.MaxPacketSize} {
+		if n > 0 {
+			return n
+		}
+	}
+	return defaultMaxUDPPacketSize
+}
+
+// tcpFallbackEnabled reports whether oversized packet writes may use TCP.
+func (c *Config) tcpFallbackEnabled() bool {
+	return c.EnableTCPFallback || c.TCPFallback || c.FallbackToTCP || !c.DisableTcpPings
 }
 
 // ParseCIDRs return a possible empty list of all Network that have been parsed
