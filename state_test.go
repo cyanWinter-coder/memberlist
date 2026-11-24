@@ -47,6 +47,7 @@ func TestMemberList_Probe(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = time.Millisecond
 		c.ProbeInterval = 10 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 	})
 	defer func() {
 		if err := m1.Shutdown(); err != nil {
@@ -110,6 +111,7 @@ func TestMemberList_ProbeNode_Suspect(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = time.Millisecond
 		c.ProbeInterval = 10 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 	})
 	defer func() {
 		if err := m1.Shutdown(); err != nil {
@@ -185,6 +187,7 @@ func TestMemberList_ProbeNode_Suspect_Dogpile(t *testing.T) {
 			m := HostMemberlist(addr.String(), t, func(c *Config) {
 				c.ProbeTimeout = time.Millisecond
 				c.ProbeInterval = 100 * time.Millisecond
+				c.ProbeFailureThreshold = 1
 				c.SuspicionMult = 5
 				c.SuspicionMaxTimeoutMult = 2
 			})
@@ -595,6 +598,7 @@ func TestMemberList_ProbeNode_Awareness_Degraded(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = 10 * time.Millisecond
 		c.ProbeInterval = 200 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 		probeTimeMin = 2*c.ProbeInterval - 50*time.Millisecond
 	})
 	defer func() {
@@ -816,6 +820,7 @@ func TestMemberList_ProbeNode_Awareness_MissedNack(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = 10 * time.Millisecond
 		c.ProbeInterval = 200 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 		probeTimeMax = c.ProbeInterval + 50*time.Millisecond
 	})
 	t.Cleanup(func() {
@@ -895,6 +900,7 @@ func TestMemberList_ProbeNode_Awareness_OldProtocol(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = 10 * time.Millisecond
 		c.ProbeInterval = 200 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 		probeTimeMax = c.ProbeInterval + 20*time.Millisecond
 	})
 	defer func() {
@@ -977,6 +983,7 @@ func TestMemberList_ProbeNode_Buddy(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = time.Millisecond
 		c.ProbeInterval = 10 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 	})
 	defer func() {
 		if err := m1.Shutdown(); err != nil {
@@ -1033,6 +1040,7 @@ func TestMemberList_ProbeNode(t *testing.T) {
 	m1 := HostMemberlist(addr1.String(), t, func(c *Config) {
 		c.ProbeTimeout = time.Millisecond
 		c.ProbeInterval = 10 * time.Millisecond
+		c.ProbeFailureThreshold = 1
 	})
 	defer func() {
 		if err := m1.Shutdown(); err != nil {

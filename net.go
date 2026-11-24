@@ -590,6 +590,10 @@ func (m *Memberlist) handlePing(buf []byte, from net.Addr) {
 		Addr: addr,
 		Name: p.SourceNode,
 	}
+	m.logger.Printf("[DEBUG] memberlist: Received probe (seq=%d, node=%q) from %s, replying to %s",
+		p.SeqNo, p.Node, LogAddress(from), a.String())
+	metrics.IncrCounterWithLabels([]string{"memberlist", "probe", "received"}, 1, m.metricLabels)
+
 	if err := m.encodeAndSendMsg(a, ackRespMsg, &ack); err != nil {
 		m.logger.Printf("[ERR] memberlist: Failed to send ack: %s %s", err, LogAddress(from))
 	}

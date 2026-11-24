@@ -131,6 +131,32 @@ type Config struct {
 	ProbeInterval time.Duration
 	ProbeTimeout  time.Duration
 
+	// ProbeMinInterval and ProbeMaxInterval bound the adaptive probe
+	// interval. ProbeInterval remains the normal/base interval and the
+	// lower bound when ProbeMinInterval is zero. ProbeMaxInterval defaults
+	// to AwarenessMaxMultiplier * ProbeInterval. A healthy node returns to
+	// the base/lower interval immediately after one successful probe.
+	ProbeMinInterval time.Duration
+	ProbeMaxInterval time.Duration
+
+	// ProbeSuccessWindow is the number of most recent probe outcomes used to
+	// calculate the local success rate. A zero value uses a small default.
+	ProbeSuccessWindow int
+
+	// ProbeFailureThreshold is the number of consecutive complete probe
+	// failures for one node required before this node originates a suspect
+	// message. A single lost UDP packet is already retried through indirect
+	// and TCP probes and does not count unless the complete probe round
+	// fails; setting this to one restores the historical behavior. A zero
+	// value uses DefaultProbeFailureThreshold.
+	ProbeFailureThreshold int
+
+	// ProbeQueueDepth bounds the number of scheduled probe rounds that may
+	// be pending behind a slow probe. When the queue is full, the next round
+	// is skipped and the skip is counted and emitted as a metric. A zero
+	// value uses DefaultProbeQueueDepth.
+	ProbeQueueDepth int
+
 	// DisableTcpPings will turn off the fallback TCP pings that are attempted
 	// if the direct UDP ping fails. These get pipelined along with the
 	// indirect UDP pings.
@@ -316,8 +342,11 @@ func DefaultLANConfig() *Config {
 		PushPullInterval:        30 * time.Second,       // Low frequency
 		ProbeTimeout:            500 * time.Millisecond, // Reasonable RTT time for LAN
 		ProbeInterval:           1 * time.Second,        // Failure check every second
-		DisableTcpPings:         false,                  // TCP pings are safe, even with mixed versions
-		AwarenessMaxMultiplier:  8,                      // Probe interval backs off to 8 seconds
+		ProbeSuccessWindow:      DefaultProbeSuccessWindow,
+		ProbeFailureThreshold:   DefaultProbeFailureThreshold,
+		ProbeQueueDepth:         DefaultProbeQueueDepth,
+		DisableTcpPings:         false, // TCP pings are safe, even with mixed versions
+		AwarenessMaxMultiplier:  8,     // Probe interval backs off to 8 seconds
 
 		GossipNodes:          3,                      // Gossip to 3 nodes
 		GossipInterval:       200 * time.Millisecond, // Gossip more rapidly

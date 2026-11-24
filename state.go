@@ -123,26 +123,29 @@ func (m *Memberlist) schedule() {
 	m.tickerLock.Lock()
 	defer m.tickerLock.Unlock()
 
-	// If we already have tickers, then don't do anything, since we're
-	// scheduled
-	if len(m.tickers) > 0 {
+	// If we already have background loops, then don't do anything, since
+	// we're scheduled.
+	if m.stopTick != nil {
 		return
 	}
 
 	// Create the stop tick channel, a blocking channel. We close this
 	// when we should stop the tickers.
 	stopCh := make(chan struct{})
+	scheduled := false
 
-	// Create a new probeTicker
+	// Create the adaptive probe trigger and its bounded task worker.
 	if m.config.ProbeInterval > 0 {
-		t := time.NewTicker(m.config.ProbeInterval)
-		go m.triggerFunc(m.config.ProbeInterval, t.C, stopCh, m.probe)
-		m.tickers = append(m.tickers, t)
+		m.initProbeQueue()
+		go m.probeWorker(stopCh)
+		go m.probeTrigger(stopCh)
+		scheduled = true
 	}
 
 	// Create a push pull ticker if needed
 	if m.config.PushPullInterval > 0 {
 		go m.pushPullTrigger(stopCh)
+		scheduled = true
 	}
 
 	// Create a gossip ticker if needed
@@ -150,11 +153,12 @@ func (m *Memberlist) schedule() {
 		t := time.NewTicker(m.config.GossipInterval)
 		go m.triggerFunc(m.config.GossipInterval, t.C, stopCh, m.gossip)
 		m.tickers = append(m.tickers, t)
+		scheduled = true
 	}
 
-	// If we made any tickers, then record the stopTick channel for
-	// later.
-	if len(m.tickers) > 0 {
+	// If we started any loops, record the stop channel so they can be
+	// stopped later.
+	if scheduled {
 		m.stopTick = stopCh
 	}
 }
@@ -174,6 +178,67 @@ func (m *Memberlist) triggerFunc(stagger time.Duration, C <-chan time.Time, stop
 		case <-C:
 			f()
 		case <-stop:
+			return
+		}
+	}
+}
+
+// probeWorker serializes probe rounds and drains the bounded probe queue.
+// The bound prevents a slow or overloaded node from causing probe tasks to
+// accumulate without limit; overflow is counted by enqueueProbeRound.
+func (m *Memberlist) probeWorker(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-m.probeQueue:
+			m.probe()
+		}
+	}
+}
+
+// probeTrigger schedules probe rounds using the current adaptive interval.
+// It never runs a probe directly: admission goes through the bounded queue.
+func (m *Memberlist) probeTrigger(stop <-chan struct{}) {
+	interval := m.CurrentProbeInterval()
+	if interval <= 0 {
+		interval = m.config.ProbeInterval
+	}
+
+	// Use a random stagger to avoid synchronizing with other nodes, then run
+	// the first round immediately after that stagger. Subsequent rounds use
+	// the current adaptive interval.
+	randStagger := rand.N(interval)
+	timer := time.NewTimer(randStagger)
+	select {
+	case <-timer.C:
+		m.enqueueProbeRound()
+	case <-stop:
+		timer.Stop()
+		return
+	}
+
+	for {
+		interval = m.CurrentProbeInterval()
+		if interval <= 0 {
+			interval = m.config.ProbeInterval
+		}
+		timer.Reset(interval)
+
+		select {
+		case <-timer.C:
+			// Receiving from C drains the timer, so Reset is safe at the
+			// top of the next iteration.
+			m.enqueueProbeRound()
+		case <-m.probeIntervalChanged:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-stop:
+			timer.Stop()
 			return
 		}
 	}
@@ -212,12 +277,12 @@ func (m *Memberlist) deschedule() {
 	m.tickerLock.Lock()
 	defer m.tickerLock.Unlock()
 
-	// If we have no tickers, then we aren't scheduled.
-	if len(m.tickers) == 0 {
+	// If we have no background loops, then we aren't scheduled.
+	if m.stopTick == nil {
 		return
 	}
 
-	// Close the stop channel so all the ticker listeners stop.
+	// Close the stop channel so all the loop listeners stop.
 	close(m.stopTick)
 
 	// Explicitly stop all the tickers themselves so they don't take
@@ -226,6 +291,7 @@ func (m *Memberlist) deschedule() {
 		t.Stop()
 	}
 	m.tickers = nil
+	m.stopTick = nil
 }
 
 // Tick is used to perform a single round of failure detection and gossip
@@ -304,6 +370,16 @@ func failedRemote(err error) bool {
 // probeNode handles a single round of failure checking on a node.
 func (m *Memberlist) probeNode(node *nodeState) {
 	defer metrics.MeasureSinceWithLabels([]string{"memberlist", "probeNode"}, time.Now(), m.metricLabels)
+	m.probeStarted.Add(1)
+	metrics.IncrCounterWithLabels([]string{"memberlist", "probe", "started"}, 1, m.metricLabels)
+
+	// outcome is recorded by the deferred adaptive-probe bookkeeping. Local
+	// encode/send errors leave it Inconclusive so they do not falsely count
+	// as a dead peer or rewrite the success-rate window.
+	outcome := probeOutcomeInconclusive
+	defer func() {
+		m.completeProbe(node.Name, outcome)
+	}()
 
 	// We use our health awareness to scale the overall probe interval, so we
 	// slow down if we detect problems. The ticker that calls us can handle
@@ -380,6 +456,11 @@ func (m *Memberlist) probeNode(node *nodeState) {
 		}
 	}
 
+	m.probeSent.Add(1)
+	metrics.IncrCounterWithLabels([]string{"memberlist", "probe", "sent"}, 1, m.metricLabels)
+	m.logger.Printf("[DEBUG] memberlist: Sent probe to %s (seq=%d, udp_timeout=%s, ack_timeout=%s, adaptive_interval=%s)",
+		node.Name, ping.SeqNo, m.config.ProbeTimeout, probeInterval, m.CurrentProbeInterval())
+
 	// Arrange for our self-awareness to get updated. At this point we've
 	// sent the ping, so any return statement means the probe succeeded
 	// which will improve our health until we get to the failure scenarios
@@ -395,6 +476,7 @@ func (m *Memberlist) probeNode(node *nodeState) {
 				rtt := v.Timestamp.Sub(sent)
 				m.config.Ping.NotifyPingComplete(&node.Node, rtt, v.Payload)
 			}
+			outcome = probeOutcomeSuccess
 			return
 		}
 
@@ -485,6 +567,7 @@ HANDLE_REMOTE_FAILURE:
 	// out first to allow the normal UDP-based acks to come in.
 	v := <-ackCh
 	if v.Complete {
+		outcome = probeOutcomeSuccess
 		return
 	}
 
@@ -494,6 +577,7 @@ HANDLE_REMOTE_FAILURE:
 	for didContact := range fallbackCh {
 		if didContact {
 			m.logger.Printf("[WARN] memberlist: Was able to connect to %s over TCP but UDP probes failed, network may be misconfigured", node.Name)
+			outcome = probeOutcomeSuccess
 			return
 		}
 	}
@@ -514,10 +598,10 @@ HANDLE_REMOTE_FAILURE:
 		awarenessDelta += 1
 	}
 
-	// No acks received from target, suspect it as failed.
-	m.logger.Printf("[INFO] memberlist: Suspect %s has failed, no acks received", node.Name)
-	s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
-	m.suspectNode(&s)
+	// No acks received from target. Record the complete probe failure; the
+	// adaptive bookkeeping escalates to suspicion only after the configured
+	// consecutive-failure threshold.
+	outcome = probeOutcomeFailure
 }
 
 // Ping initiates a ping to the node with the specified name.
@@ -570,9 +654,14 @@ func (m *Memberlist) resetNodes() {
 	deadIdx := moveDeadNodes(m.nodes, m.config.GossipToTheDeadTime)
 
 	// Deregister the dead nodes
+	removed := make([]string, 0, len(m.nodes)-deadIdx)
 	for i := deadIdx; i < len(m.nodes); i++ {
+		removed = append(removed, m.nodes[i].Name)
 		delete(m.nodeMap, m.nodes[i].Name)
 		m.nodes[i] = nil
+	}
+	if m.probeHealth != nil {
+		m.probeHealth.removeNodes(removed)
 	}
 
 	// Trim the nodes to exclude the dead nodes
@@ -1081,6 +1170,16 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 
 	// Clear out any suspicion timer that may be in effect.
 	delete(m.nodeTimers, a.Node)
+
+	// A valid alive/refutation means the node is reachable again; do not
+	// carry old consecutive probe failures into this incarnation and use it
+	// as a fast adaptive-interval recovery signal.
+	if m.probeHealth != nil {
+		m.probeHealth.recoverNode(a.Node)
+	}
+	// An alive/refutation is also a recovery signal; wake the adaptive
+	// scheduler so it can return to the normal interval immediately.
+	m.notifyProbeIntervalChanged()
 
 	// Store the old state and meta data
 	oldState := state.State

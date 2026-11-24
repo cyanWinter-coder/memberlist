@@ -75,6 +75,16 @@ type Memberlist struct {
 	stopTick   chan struct{}
 	probeIndex int
 
+	probeHealth          *probeHealthTracker
+	probeQueue           chan struct{}
+	probeIntervalChanged chan struct{}
+	probeEnqueued        atomic.Uint64
+	probeQueueFull       atomic.Uint64
+	probeStarted         atomic.Uint64
+	probeSent            atomic.Uint64
+	probeSucceeded       atomic.Uint64
+	probeFailed          atomic.Uint64
+
 	ackLock     sync.Mutex
 	ackHandlers map[uint32]*ackHandler
 
@@ -225,6 +235,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
 	}
+	m.initProbeQueue()
 
 	// Get the final advertise address from the transport, which may need
 	// to see which address we bound to. We'll refresh this each time we
