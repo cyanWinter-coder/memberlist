@@ -189,6 +189,20 @@ type Config struct {
 	// AES-192, or AES-256.
 	SecretKey []byte
 
+	// SecretKeys is an optional set of additional keys installed on the
+	// keyring for decryption only, in the given order. Outgoing messages are
+	// always encrypted with SecretKey; inbound messages may have been
+	// encrypted with SecretKey or with any key in SecretKeys. This is what
+	// makes a zero-downtime key rotation possible: during the rotation window
+	// every node carries both the outgoing key and the incoming key, then the
+	// retired key is simply dropped from the configuration once the rollout
+	// is complete.
+	//
+	// If SecretKey is empty, the first entry of SecretKeys becomes the primary
+	// key (used for encryption). Each key should be either 16, 24, or 32 bytes
+	// to select AES-128, AES-192, or AES-256.
+	SecretKeys [][]byte
+
 	// The keyring holds all of the encryption keys used internally. It is
 	// automatically initialized using the SecretKey and SecretKeys values.
 	Keyring *Keyring
@@ -327,8 +341,9 @@ func DefaultLANConfig() *Config {
 
 		EnableCompression: true, // Enable compression by default
 
-		SecretKey: nil,
-		Keyring:   nil,
+		SecretKey:  nil,
+		SecretKeys: nil,
+		Keyring:    nil,
 
 		DNSConfigPath: "/etc/resolv.conf",
 

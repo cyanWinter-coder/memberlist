@@ -318,6 +318,72 @@ func TestCreate_keyringAndSecretKey(t *testing.T) {
 	}
 }
 
+func TestCreate_secretKeysRotating(t *testing.T) {
+	oldKey := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	newKey := []byte{15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}
+
+	t.Run("SecretKey is primary and SecretKeys are decryption-only", func(t *testing.T) {
+		c := DefaultLANConfig()
+		c.BindAddr = getBindAddr().String()
+		c.SecretKey = newKey
+		c.SecretKeys = [][]byte{oldKey}
+
+		m, err := Create(c)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+
+		require.True(t, m.config.EncryptionEnabled())
+		require.Equal(t, newKey, m.config.Keyring.GetPrimaryKey())
+
+		ids := m.config.Keyring.GetKeyIDs()
+		require.Len(t, ids, 2)
+		require.Equal(t, KeyIDForKey(newKey), ids[0])
+		require.Equal(t, KeyIDForKey(oldKey), ids[1])
+	})
+
+	t.Run("first SecretKeys entry becomes primary without SecretKey", func(t *testing.T) {
+		c := DefaultLANConfig()
+		c.BindAddr = getBindAddr().String()
+		c.SecretKeys = [][]byte{newKey, oldKey}
+
+		m, err := Create(c)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+
+		require.Equal(t, newKey, m.config.Keyring.GetPrimaryKey())
+		require.Len(t, m.config.Keyring.GetKeys(), 2)
+	})
+
+	t.Run("invalid secondary key is rejected", func(t *testing.T) {
+		c := DefaultLANConfig()
+		c.BindAddr = getBindAddr().String()
+		c.SecretKey = newKey
+		c.SecretKeys = [][]byte{[]byte("too-short")}
+
+		_, err := Create(c)
+		require.Error(t, err)
+	})
+
+	t.Run("SecretKeys are added to an existing keyring", func(t *testing.T) {
+		c := DefaultLANConfig()
+		c.BindAddr = getBindAddr().String()
+		keyring, err := NewKeyring(nil, oldKey)
+		require.NoError(t, err)
+		c.Keyring = keyring
+		c.SecretKey = newKey
+		c.SecretKeys = [][]byte{oldKey}
+
+		m, err := Create(c)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+
+		// The primary is promoted and the old generation stays decryptable;
+		// adding it again as a secondary key is a no-op, not a duplicate.
+		require.Equal(t, newKey, m.config.Keyring.GetPrimaryKey())
+		require.Len(t, m.config.Keyring.GetKeys(), 2)
+	})
+}
+
 func TestCreate_invalidLoggerSettings(t *testing.T) {
 	c := DefaultLANConfig()
 	c.BindAddr = getBindAddr().String()
@@ -2424,4 +2490,174 @@ func runStep(t *testing.T, name string, fn func(t *testing.T)) {
 	if !t.Run(name, fn) {
 		t.FailNow()
 	}
+}
+
+// TestMemberlist_KeyRotationRolling exercises a quarterly-style key rotation
+// on a live cluster under the constraints an operator actually has: nodes are
+// rolled one at a time, both key generations must keep talking in both
+// directions throughout, and the old key can be removed once every node has
+// the new one.
+func TestMemberlist_KeyRotationRolling(t *testing.T) {
+	oldKey := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	newKey := []byte{15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}
+
+	type node struct {
+		m    *Memberlist
+		del  *MockDelegate
+		addr string
+	}
+	var nodes []*node
+
+	newNode := func(primary []byte, secondary ...[]byte) *node {
+		c := testConfig(t)
+		c.SecretKey = primary
+		c.SecretKeys = secondary
+		c.GossipInterval = 20 * time.Millisecond
+		c.ProbeInterval = 50 * time.Millisecond
+		c.ProbeTimeout = 200 * time.Millisecond
+		d := &MockDelegate{}
+		c.Delegate = d
+		m, err := Create(c)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, m.Shutdown()) })
+		n := &node{m: m, del: d}
+		n.addr = fmt.Sprintf("%s/%s:%d", m.config.Name, m.config.BindAddr, m.config.BindPort)
+		nodes = append(nodes, n)
+		return n
+	}
+
+	// joinAll makes sure every node knows about every other node, so later
+	// checks are about message flow and not about membership propagation.
+	joinAll := func() {
+		t.Helper()
+		for _, src := range nodes {
+			for _, dst := range nodes {
+				if src == dst || src.m.NumMembers() == len(nodes) {
+					continue
+				}
+				if _, err := src.m.Join([]string{dst.addr}); err != nil {
+					t.Fatalf("join %s -> %s: %v", src.m.config.Name, dst.m.config.Name, err)
+				}
+			}
+		}
+		for _, n := range nodes {
+			waitUntilSize(t, n.m, len(nodes))
+		}
+	}
+
+	findNode := func(m *Memberlist, name string) *Node {
+		t.Helper()
+		for _, member := range m.Members() {
+			if member.Name == name {
+				return member
+			}
+		}
+		return nil
+	}
+
+	// waitForMsg waits until the delegate on dst has received body. Both the
+	// reliable (TCP, encrypted stream) and best-effort (UDP, encrypted
+	// packet) paths are exercised; a key mismatch on either side shows up as
+	// this timing out.
+	waitForMsg := func(src, dst *node, body []byte) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			for _, got := range dst.del.getMessages() {
+				if bytes.Equal(got, body) {
+					return
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s -> %s: user message never arrived (%q)", src.m.config.Name, dst.m.config.Name, body)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// checkBidirectional proves both directions keep working for every pair,
+	// over both transports.
+	checkBidirectional := func(step string) {
+		t.Helper()
+		for _, src := range nodes {
+			for _, dst := range nodes {
+				if src == dst {
+					continue
+				}
+				remote := findNode(src.m, dst.m.config.Name)
+				require.NotNil(t, remote, "%s: lost sight of %s", src.m.config.Name, dst.m.config.Name)
+
+				udpAddr, err := net.ResolveUDPAddr("udp", remote.Address())
+				require.NoError(t, err)
+				if _, err := src.m.Ping(dst.m.config.Name, udpAddr); err != nil {
+					t.Fatalf("%s: %s -> %s udp ping failed: %v", step, src.m.config.Name, dst.m.config.Name, err)
+				}
+
+				body := []byte(step + ":" + src.m.config.Name + "->" + dst.m.config.Name)
+				require.NoError(t, src.m.SendReliable(remote, body),
+					"%s: %s -> %s reliable send failed", step, src.m.config.Name, dst.m.config.Name)
+				waitForMsg(src, dst, body)
+
+				// And the best-effort path in the same direction.
+				uBody := append(append([]byte{}, body...), []byte(":udp")...)
+				require.NoError(t, src.m.SendBestEffort(remote, uBody),
+					"%s: %s -> %s best-effort send failed", step, src.m.config.Name, dst.m.config.Name)
+				waitForMsg(src, dst, uBody)
+			}
+		}
+	}
+
+	// Phase 0: all nodes use the old key only.
+	newNode(oldKey)
+	newNode(oldKey)
+	newNode(oldKey)
+	joinAll()
+	checkBidirectional("phase0")
+
+	// Phase 1: install the new key on every node as a decryption-only key.
+	// Restarts are simulated by mutating the live keyring, which is exactly
+	// what a config reload does. Writes still use the old primary.
+	for _, n := range nodes {
+		require.NoError(t, n.m.config.Keyring.AddKey(newKey))
+		require.Equal(t, KeyIDForKey(oldKey), mustPrimaryKeyID(t, n.m))
+	}
+	checkBidirectional("phase1")
+
+	// Phase 2: promote the new key on one node at a time. The cluster is
+	// mixed-generation for the whole phase: some nodes encrypt with the old
+	// key, some with the new one, and all of them must understand each other.
+	for _, n := range nodes {
+		require.NoError(t, n.m.config.Keyring.UseKey(newKey))
+		require.Equal(t, KeyIDForKey(newKey), mustPrimaryKeyID(t, n.m))
+		checkBidirectional("phase2-" + n.m.config.Name)
+	}
+
+	// A brand new node that has never seen the old key must be able to join,
+	// proving the cluster is writing with the new key.
+	newNode(newKey)
+	joinAll()
+	checkBidirectional("phase2-joined")
+
+	// Phase 3: retire the old key everywhere, one node at a time. From now
+	// on no node holds the old generation at all.
+	for _, n := range nodes {
+		if err := n.m.config.Keyring.RemoveKey(oldKey); err != nil {
+			t.Fatalf("%s: remove old key: %v", n.m.config.Name, err)
+		}
+		require.Len(t, n.m.config.Keyring.GetKeys(), 1)
+		require.Equal(t, KeyIDForKey(newKey), mustPrimaryKeyID(t, n.m))
+		checkBidirectional("phase3-" + n.m.config.Name)
+	}
+
+	// The membership must still be fully converged after the old key is gone.
+	for _, n := range nodes {
+		require.Equal(t, len(nodes), n.m.NumMembers())
+	}
+}
+
+func mustPrimaryKeyID(t *testing.T, m *Memberlist) KeyID {
+	t.Helper()
+	id, ok := m.config.Keyring.GetPrimaryKeyID()
+	require.True(t, ok)
+	return id
 }

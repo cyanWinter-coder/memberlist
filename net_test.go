@@ -6,6 +6,7 @@ package memberlist
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -985,11 +986,18 @@ func TestGossip_MismatchedKeys(t *testing.T) {
 		}
 	}()
 
-	// Make sure we get this error on the joining side
+	// Make sure we get an identifiable key-mismatch error on the joining
+	// side, that it names the local key generation (never key material),
+	// and that it is machine-detectable with errors.Is.
 	_, err = m2.Join([]string{c1.Name + "/" + c1.BindAddr})
-	if err == nil || !strings.Contains(err.Error(), "no installed keys could decrypt the message") {
-		t.Fatalf("bad: %s", err)
-	}
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrKeyMismatch), "expected ErrKeyMismatch, got: %v", err)
+	require.Contains(t, err.Error(), "encryption key mismatch")
+
+	wantID := KeyIDForKey(c2.SecretKey).String()
+	require.Contains(t, err.Error(), wantID, "error should name the local key id")
+	require.NotContains(t, err.Error(), string(c1.SecretKey))
+	require.NotContains(t, err.Error(), string(c2.SecretKey))
 }
 
 func listenUDP(t *testing.T) *net.UDPConn {

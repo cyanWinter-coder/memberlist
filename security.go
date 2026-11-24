@@ -8,8 +8,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 /*
@@ -19,6 +23,11 @@ currently support the following versions:
 
 	0 - AES-GCM 128, using PKCS7 padding
 	1 - AES-GCM 128, no padding. Padding not needed, caused bloat.
+
+The version byte is the only key-related information on the wire: a message
+never carries key material or a key name, so the format is unchanged by the
+introduction of key identifiers below. A receiver tries every installed key
+(see Keyring) and decrypts whichever generation the sender used.
 */
 type encryptionVersion uint8
 
@@ -33,7 +42,65 @@ const (
 	tagSize        = 16
 	maxPadOverhead = 16
 	blockSize      = aes.BlockSize
+
+	// keyIDSize is the number of SHA-256 bytes kept as a key identifier.
+	keyIDSize = 8
 )
+
+// KeyID is a short, non-secret identifier for an encryption key. It is the
+// leading bytes of the key's SHA-256 digest, so every node derives the same
+// identifier for the same key without coordination, while the identifier
+// itself does not reveal the key.
+//
+// Key identifiers are used only for observability and diagnostics: they are
+// logged at startup and are included in key mismatch errors, which lets an
+// operator compare the key generations installed on two nodes that cannot
+// talk to each other. They are never sent on the wire, so the packet format
+// remains compatible with nodes that predate them.
+type KeyID [keyIDSize]byte
+
+// KeyIDForKey returns the identifier for the given key. The key should be
+// validated with ValidateKey first.
+func KeyIDForKey(key []byte) KeyID {
+	sum := sha256.Sum256(key)
+	var id KeyID
+	copy(id[:], sum[:keyIDSize])
+	return id
+}
+
+// String renders the identifier as hex, which is the form used in logs and
+// error messages.
+func (id KeyID) String() string {
+	return hex.EncodeToString(id[:])
+}
+
+// ErrKeyMismatch is returned when a received payload cannot be decrypted and
+// authenticated with any of the keys currently installed. The concrete error
+// is a *KeyMismatchError, which names the key identifiers that were tried so
+// the mismatch can be diagnosed without logging key material.
+var ErrKeyMismatch = errors.New("encryption key mismatch")
+
+// KeyMismatchError reports that a payload could not be decrypted with any key
+// on the local keyring. TriedKeyIDs lists the identifiers of the keys that
+// were attempted, in order. It carries no key material.
+type KeyMismatchError struct {
+	TriedKeyIDs []KeyID
+}
+
+func (e *KeyMismatchError) Error() string {
+	ids := make([]string, len(e.TriedKeyIDs))
+	for i, id := range e.TriedKeyIDs {
+		ids[i] = id.String()
+	}
+	if len(ids) == 0 {
+		return ErrKeyMismatch.Error() + ": no keys are installed"
+	}
+	return fmt.Sprintf("%s: payload could not be decrypted with any installed key (tried key ids: %s)",
+		ErrKeyMismatch.Error(), strings.Join(ids, ", "))
+}
+
+// Unwrap allows errors.Is(err, ErrKeyMismatch) to identify this error.
+func (e *KeyMismatchError) Unwrap() error { return ErrKeyMismatch }
 
 // pkcs7encode is used to pad a byte buffer to a specific block size using
 // the PKCS7 algorithm. "Ignores" some bytes to compensate for IV
@@ -169,6 +236,13 @@ func decryptMessage(key, msg []byte, data []byte) ([]byte, error) {
 // decryptPayload is used to decrypt a message with a given key,
 // and verify it's contents. Any padding will be removed, and a
 // slice to the plaintext is returned. Decryption is done IN PLACE!
+//
+// During a key rotation the keyring holds both the old and the new key, so
+// messages from either generation are accepted here while senders encrypt
+// with the current primary key only. Keys are tried in ring order. If none of
+// them can authenticate the payload, a *KeyMismatchError is returned that
+// lists the key identifiers that were tried; use errors.Is(err,
+// ErrKeyMismatch) to detect this case.
 func decryptPayload(keys [][]byte, msg []byte, data []byte) ([]byte, error) {
 	// Ensure we have at least one byte
 	if len(msg) == 0 {
@@ -198,7 +272,11 @@ func decryptPayload(keys [][]byte, msg []byte, data []byte) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("no installed keys could decrypt the message")
+	tried := make([]KeyID, len(keys))
+	for i, key := range keys {
+		tried[i] = KeyIDForKey(key)
+	}
+	return nil, &KeyMismatchError{TriedKeyIDs: tried}
 }
 
 func appendBytes(first []byte, second []byte) []byte {

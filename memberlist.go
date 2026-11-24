@@ -106,19 +106,35 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 			conf.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
 	}
 
-	if len(conf.SecretKey) > 0 {
+	if len(conf.SecretKey) > 0 || len(conf.SecretKeys) > 0 {
+		// SecretKey is the primary (encrypting) key. When it is omitted the
+		// first entry of SecretKeys takes that role, so a rotation can be
+		// expressed purely as an ordered list of keys. All remaining keys
+		// are installed for decryption only.
+		primaryKey := conf.SecretKey
+		secondaryKeys := conf.SecretKeys
+		if len(primaryKey) == 0 {
+			primaryKey = secondaryKeys[0]
+			secondaryKeys = secondaryKeys[1:]
+		}
+
 		if conf.Keyring == nil {
-			keyring, err := NewKeyring(nil, conf.SecretKey)
+			keyring, err := NewKeyring(secondaryKeys, primaryKey)
 			if err != nil {
 				return nil, err
 			}
 			conf.Keyring = keyring
 		} else {
-			if err := conf.Keyring.AddKey(conf.SecretKey); err != nil {
+			if err := conf.Keyring.AddKey(primaryKey); err != nil {
 				return nil, err
 			}
-			if err := conf.Keyring.UseKey(conf.SecretKey); err != nil {
+			if err := conf.Keyring.UseKey(primaryKey); err != nil {
 				return nil, err
+			}
+			for _, key := range secondaryKeys {
+				if err := conf.Keyring.AddKey(key); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -135,6 +151,14 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	logger := conf.Logger
 	if logger == nil {
 		logger = log.New(logDest, "", log.LstdFlags)
+	}
+
+	// Surface the installed key generations so a rotation in progress is
+	// visible in the logs. Only non-secret key identifiers are logged, never
+	// key material.
+	if conf.EncryptionEnabled() {
+		logger.Printf("[DEBUG] memberlist: keyring holds %d key(s), key ids: %v (first is primary)",
+			len(conf.Keyring.GetKeys()), conf.Keyring.GetKeyIDs())
 	}
 
 	// Set up a network transport by default if a custom one wasn't given
@@ -283,7 +307,7 @@ func (m *Memberlist) Join(existing []string) (int, error) {
 			hp := joinHostPort(addr.ip.String(), addr.port)
 			a := Address{Addr: hp, Name: addr.nodeName}
 			if err := m.pushPullNode(a, true); err != nil {
-				err = fmt.Errorf("failed to join %s: %v", a.Addr, err)
+				err = fmt.Errorf("failed to join %s: %w", a.Addr, err)
 				errs = multierror.Append(errs, err)
 				m.logger.Printf("[DEBUG] memberlist: %v", err)
 				continue

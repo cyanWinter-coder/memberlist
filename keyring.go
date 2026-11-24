@@ -14,6 +14,10 @@ type Keyring struct {
 	// ordered in such a way where the first key (index 0) is the primary key,
 	// which is used for encrypting messages, and is the first key tried during
 	// message decryption.
+	//
+	// The slice is replaced wholesale on every update and never mutated in
+	// place, so snapshots handed out by GetKeys stay valid while a rotation
+	// installs a new generation.
 	keys [][]byte
 
 	// The keyring lock is used while performing IO operations on the keyring.
@@ -93,7 +97,13 @@ func (k *Keyring) AddKey(key []byte) error {
 		}
 	}
 
-	keys := append(k.keys, key)
+	// Build the new ring in a fresh slice. The old ring must stay
+	// untouched so that decryption snapshots taken concurrently with a
+	// rotation keep working; appending to k.keys directly could write
+	// into the array a snapshot still points at.
+	keys := make([][]byte, 0, len(k.keys)+1)
+	keys = append(keys, k.keys...)
+	keys = append(keys, key)
 	primaryKey := k.getPrimaryKeyLocked()
 	if primaryKey == nil {
 		primaryKey = key
@@ -122,13 +132,22 @@ func (k *Keyring) RemoveKey(key []byte) error {
 	k.l.Lock()
 	defer k.l.Unlock()
 
+	if len(k.keys) == 0 {
+		return fmt.Errorf("key is not in the keyring")
+	}
 	if bytes.Equal(key, k.keys[0]) {
 		return fmt.Errorf("removing the primary key is not allowed")
 	}
 	for i, installedKey := range k.keys {
 		if bytes.Equal(key, installedKey) {
-			keys := append(k.keys[:i], k.keys[i+1:]...)
+			// Copy everything but the removed key into a fresh slice.
+			// Shifting elements in place would corrupt snapshots that
+			// concurrent readers obtained via GetKeys.
+			keys := make([][]byte, 0, len(k.keys)-1)
+			keys = append(keys, k.keys[:i]...)
+			keys = append(keys, k.keys[i+1:]...)
 			k.installKeysLocked(keys, k.keys[0])
+			break
 		}
 	}
 	return nil
@@ -147,7 +166,10 @@ func (k *Keyring) installKeysLocked(keys [][]byte, primaryKey []byte) {
 	k.keys = newKeys
 }
 
-// GetKeys returns the current set of keys on the ring.
+// GetKeys returns the current set of keys on the ring. The returned slice is
+// immutable: every update installs a fresh backing array (copy-on-write), so a
+// snapshot stays valid while a rotation is in progress and decryption always
+// sees one consistent key generation. Callers must not modify the result.
 func (k *Keyring) GetKeys() [][]byte {
 	k.l.Lock()
 	defer k.l.Unlock()
@@ -161,6 +183,32 @@ func (k *Keyring) GetPrimaryKey() (key []byte) {
 	k.l.Lock()
 	defer k.l.Unlock()
 	return k.getPrimaryKeyLocked()
+}
+
+// GetKeyIDs returns the identifiers of the keys on the ring, in the same order
+// as GetKeys: index 0 is the primary key. Identifiers are non-secret and safe
+// to log, which makes a rotation in progress observable.
+func (k *Keyring) GetKeyIDs() []KeyID {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	ids := make([]KeyID, len(k.keys))
+	for i, key := range k.keys {
+		ids[i] = KeyIDForKey(key)
+	}
+	return ids
+}
+
+// GetPrimaryKeyID returns the identifier of the primary key, and false if the
+// ring is empty (encryption disabled).
+func (k *Keyring) GetPrimaryKeyID() (KeyID, bool) {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	if len(k.keys) == 0 {
+		return KeyID{}, false
+	}
+	return KeyIDForKey(k.keys[0]), true
 }
 
 // getPrimaryKeyLocked must be called while holding the mutex

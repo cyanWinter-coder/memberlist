@@ -282,9 +282,18 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 	msgType, bufConn, dec, err := m.readStream(conn, streamLabel)
 	if err != nil {
 		if err != io.EOF {
-			m.logger.Printf("[ERR] memberlist: failed to receive: %s %s", err, LogConn(conn))
+			respMsg := err.Error()
+			if errors.Is(err, ErrKeyMismatch) {
+				m.logDecryptFailure("stream", err, conn.RemoteAddr())
+				// Keep the local key ids out of the reply: the peer has not
+				// authenticated, and this response is sent in the clear when
+				// GossipVerifyOutgoing is disabled.
+				respMsg = ErrKeyMismatch.Error()
+			} else {
+				m.logger.Printf("[ERR] memberlist: failed to receive: %s %s", err, LogConn(conn))
+			}
 
-			resp := errResp{err.Error()}
+			resp := errResp{respMsg}
 			out, err := encode(errMsg, &resp, m.config.MsgpackUseNewTimeFormat)
 			if err != nil {
 				m.logger.Printf("[ERR] memberlist: Failed to encode error response: %s", err)
@@ -409,7 +418,7 @@ func (m *Memberlist) ingestPacket(buf []byte, from net.Addr, timestamp time.Time
 				// Treat the message as plaintext
 				plain = buf
 			} else {
-				m.logger.Printf("[ERR] memberlist: Decrypt packet failed: %v %s", err, LogAddress(from))
+				m.logDecryptFailure("packet", err, from)
 				return
 			}
 		}
@@ -430,6 +439,19 @@ func (m *Memberlist) ingestPacket(buf []byte, from net.Addr, timestamp time.Time
 	} else {
 		m.handleCommand(buf, from, timestamp)
 	}
+}
+
+// logDecryptFailure reports a payload that could not be decrypted. A key
+// mismatch is called out separately and annotated with the local key
+// identifiers, so an operator can compare key generations across nodes
+// without ever logging key material.
+func (m *Memberlist) logDecryptFailure(what string, err error, from net.Addr) {
+	if errors.Is(err, ErrKeyMismatch) {
+		m.logger.Printf("[ERR] memberlist: Decrypt %s failed, encryption key mismatch (local key ids: %v): %v %s",
+			what, m.config.Keyring.GetKeyIDs(), err, LogAddress(from))
+		return
+	}
+	m.logger.Printf("[ERR] memberlist: Decrypt %s failed: %v %s", what, err, LogAddress(from))
 }
 
 func (m *Memberlist) handleCommand(buf []byte, from net.Addr, timestamp time.Time) {

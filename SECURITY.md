@@ -81,7 +81,21 @@ identity and authorization systems (e.g. mTLS and ACLs) on top.
 - **Rotate keys periodically.** Use the keyring API
   (`Keyring.AddKey`, `Keyring.UseKey`, `Keyring.RemoveKey`) to rotate the
   primary key. Additional keys remain valid for decryption during rollout, which
-  supports zero-downtime rotation.
+  supports zero-downtime rotation. The same rotation can be expressed in
+  configuration with `Config.SecretKey` (the primary, encrypting key) plus
+  `Config.SecretKeys` (extra keys accepted for decryption only):
+  1. Install the new key on every node as a secondary key and roll the nodes.
+     Outgoing traffic still uses the old primary and both generations decrypt.
+  2. Promote the new key to primary (`SecretKey` / `Keyring.UseKey`), one node
+     at a time. Traffic is mixed-generation but flows in both directions.
+  3. Once every node has the new primary, drop the old key (`SecretKeys` /
+     `Keyring.RemoveKey`) and roll again. Removing a key does not require a
+     restart if you drive the keyring directly.
+  Nodes identify key generations by a short, non-secret id (logged at startup).
+  A decryption failure caused by a missing key is reported as
+  `errors.Is(err, ErrKeyMismatch)` and names the key ids that were tried, so a
+  half-finished rotation can be diagnosed from the logs without exposing key
+  material.
 
 ### Recommendations
 
