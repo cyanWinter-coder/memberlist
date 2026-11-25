@@ -149,6 +149,10 @@ type suspect struct {
 	Incarnation uint32
 	Node        string
 	From        string // Include who is suspecting
+
+	// Generation fences suspicion messages from an older member lifecycle.
+	// It is optional on the wire for compatibility with older peers.
+	Generation uint64 `codec:",omitempty"`
 }
 
 // alive is broadcast when we know a node is alive.
@@ -163,6 +167,9 @@ type alive struct {
 	// The versions of the protocol/delegate that are being spoken, order:
 	// pmin, pmax, pcur, dmin, dmax, dcur
 	Vsn []uint8
+
+	// Generation identifies this member lifecycle and fences stale gossip.
+	Generation uint64 `codec:",omitempty"`
 }
 
 // dead is broadcast when we confirm a node is dead
@@ -171,6 +178,9 @@ type dead struct {
 	Incarnation uint32
 	Node        string
 	From        string // Include who is suspecting
+
+	// Generation fences dead/leave messages from an older member lifecycle.
+	Generation uint64 `codec:",omitempty"`
 }
 
 // pushPullHeader is used to inform the
@@ -196,6 +206,9 @@ type pushNodeState struct {
 	Incarnation uint32
 	State       NodeStateType
 	Vsn         []uint8 // Protocol versions
+
+	// Generation is optional state-generation metadata for anti-entropy.
+	Generation uint64 `codec:",omitempty"`
 }
 
 // compress is used to wrap an underlying payload
@@ -1025,6 +1038,7 @@ func (m *Memberlist) sendLocalState(conn net.Conn, join bool, streamLabel string
 		localNodes[idx].Addr = n.Addr
 		localNodes[idx].Port = n.Port
 		localNodes[idx].Incarnation = n.Incarnation
+		localNodes[idx].Generation = n.generation()
 		localNodes[idx].State = n.State
 		localNodes[idx].Meta = n.Meta
 		localNodes[idx].Vsn = []uint8{

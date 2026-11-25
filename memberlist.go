@@ -44,6 +44,11 @@ type Memberlist struct {
 	numNodes    atomic.Uint32 // Number of known nodes (estimate)
 	pushPullReq atomic.Uint32 // Number of push/pull requests
 
+	// localGeneration identifies this running member instance. It is carried
+	// in alive/refutation messages so a restarted node can fence gossip left
+	// behind by the previous instance.
+	localGeneration uint64
+
 	advertiseLock sync.RWMutex
 	advertiseAddr net.IP
 	advertisePort uint16
@@ -225,6 +230,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
 	}
+	m.localGeneration = newLocalGeneration()
 
 	// Get the final advertise address from the transport, which may need
 	// to see which address we bound to. We'll refresh this each time we
@@ -463,6 +469,7 @@ func (m *Memberlist) setAlive() error {
 
 	a := alive{
 		Incarnation: m.nextIncarnation(),
+		Generation:  m.localGeneration,
 		Node:        m.config.Name,
 		Addr:        addr,
 		Port:        uint16(port),
@@ -502,7 +509,8 @@ func (m *Memberlist) LocalNode() *Node {
 	m.nodeLock.RLock()
 	defer m.nodeLock.RUnlock()
 	state := m.nodeMap[m.config.Name]
-	return &state.Node
+	node := state.Node
+	return &node
 }
 
 // UpdateNode is used to trigger re-advertising the local node. This is
@@ -528,6 +536,7 @@ func (m *Memberlist) UpdateNode(timeout time.Duration) error {
 	// Format a new alive message
 	a := alive{
 		Incarnation: m.nextIncarnation(),
+		Generation:  m.localGeneration,
 		Node:        m.config.Name,
 		Addr:        state.Addr,
 		Port:        state.Port,
@@ -612,7 +621,8 @@ func (m *Memberlist) Members() []*Node {
 	nodes := make([]*Node, 0, len(m.nodes))
 	for _, n := range m.nodes {
 		if !n.DeadOrLeft() {
-			nodes = append(nodes, &n.Node)
+			node := n.Node
+			nodes = append(nodes, &node)
 		}
 	}
 
@@ -660,6 +670,7 @@ func (m *Memberlist) Leave(timeout time.Duration) error {
 		m.nodeLock.Lock()
 		state, ok := m.nodeMap[m.config.Name]
 		incarnation := state.Incarnation
+		generation := state.generation()
 		name := state.Name
 		m.nodeLock.Unlock()
 		if !ok {
@@ -673,6 +684,7 @@ func (m *Memberlist) Leave(timeout time.Duration) error {
 		// sure this node is gone.
 		d := dead{
 			Incarnation: incarnation,
+			Generation:  generation,
 			Node:        name,
 			From:        name,
 		}

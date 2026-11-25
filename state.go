@@ -18,6 +18,24 @@ import (
 
 type NodeStateType int
 
+// Membership state machine:
+//
+//	               alive/new generation
+//	Absent/Dead/Left ---------------------> Alive
+//	                \                    ^
+//	         suspect \                  / refutation/ack recovery
+//	                  v                /
+//	                Suspect ----------+
+//	                  |
+//	   timeout/dead   |   explicit self-dead (From == Node)
+//	                  v
+//	     Dead (partition timeout) or Left (voluntary leave)
+//
+// Incarnation and the optional Generation field fence stale gossip and timers.
+// Left is terminal for its generation; a newer generation is a new member
+// instance and may join again. Notifications are linearized with the same
+// nodeLock that performs the transition, so callers observe ordered,
+// edge-triggered join/leave/update events.
 func (t NodeStateType) metricsString() string {
 	switch t {
 	case StateAlive:
@@ -53,6 +71,11 @@ type Node struct {
 	DMin  uint8         // Min protocol version for the delegate to understand
 	DMax  uint8         // Max protocol version for the delegate to understand
 	DCur  uint8         // Current version delegate is speaking
+
+	// Generation is the monotonic lifecycle generation of this member. It
+	// fences messages and timers from an older instance or state generation.
+	// Zero means a legacy peer that only carries Incarnation.
+	Generation uint64
 }
 
 // Address returns the host:port form of a node's address, suitable for use
@@ -81,6 +104,11 @@ type nodeState struct {
 	Incarnation uint32        // Last known incarnation number
 	State       NodeStateType // Current state
 	StateChange time.Time     // Time last state change happened
+
+	// Generation is the state-machine fencing token. It mirrors Node.Generation
+	// for event consumers while remaining directly addressable in white-box
+	// state construction.
+	Generation uint64
 }
 
 // Address returns the host:port form of a node's address, suitable for use
@@ -97,6 +125,63 @@ func (n *nodeState) FullAddress() Address {
 
 func (n *nodeState) DeadOrLeft() bool {
 	return n.State == StateDead || n.State == StateLeft
+}
+
+// messageGeneration normalizes an optional wire generation. Legacy messages
+// omit Generation; their incarnation number is the generation token.
+func messageGeneration(generation uint64, incarnation uint32) uint64 {
+	if generation != 0 {
+		return generation
+	}
+	return uint64(incarnation)
+}
+
+// generation returns the authoritative generation token for a state. As with
+// messageGeneration, a state created by older code falls back to incarnation.
+func (n *nodeState) generation() uint64 {
+	if n.Generation != 0 {
+		return n.Generation
+	}
+	if n.Node.Generation != 0 {
+		return n.Node.Generation
+	}
+	return uint64(n.Incarnation)
+}
+
+// setGeneration records the fencing token on both the internal state and the
+// public node snapshot handed to delegates.
+func (n *nodeState) setGeneration(generation uint64) {
+	n.Generation = generation
+	n.Node.Generation = generation
+}
+
+// setState updates both the authoritative shadowed state field and the public
+// Node.State snapshot observed by event delegates and Members.
+func (n *nodeState) setState(state NodeStateType) {
+	n.State = state
+	n.Node.State = state
+}
+
+// staleGeneration reports whether an incoming transition belongs to an older
+// generation than the current state. Within one generation, incarnation keeps
+// its original ordering role.
+func staleGeneration(msgGeneration uint64, incarnation uint32, state *nodeState) bool {
+	in := messageGeneration(msgGeneration, incarnation)
+	cur := state.generation()
+	if in != cur {
+		return in < cur
+	}
+	return incarnation < state.Incarnation
+}
+
+// advanceGeneration records the newest generation/incarnation pair and returns
+// the generation that should be stored on the state.
+func advanceGeneration(msgGeneration uint64, incarnation uint32, current uint64) uint64 {
+	next := messageGeneration(msgGeneration, incarnation)
+	if next < current {
+		return current
+	}
+	return next
 }
 
 // ackHandler is used to register handlers for incoming acks and nacks.
@@ -361,7 +446,7 @@ func (m *Memberlist) probeNode(node *nodeState) {
 		} else {
 			msgs = append(msgs, buf.Bytes())
 		}
-		s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
+		s := suspect{Incarnation: node.Incarnation, Generation: node.generation(), Node: node.Name, From: m.config.Name}
 		if buf, err := encode(suspectMsg, &s, m.config.MsgpackUseNewTimeFormat); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to encode suspect message: %s", err)
 			return
@@ -391,6 +476,10 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	select {
 	case v := <-ackCh:
 		if v.Complete {
+			// A current ack is positive proof that a node we were already
+			// suspicious of is reachable again. Clear the stale suspicion
+			// immediately instead of waiting for gossip refutation to arrive.
+			m.recoverNode(node.Name, node.generation())
 			if m.config.Ping != nil {
 				rtt := v.Timestamp.Sub(sent)
 				m.config.Ping.NotifyPingComplete(&node.Node, rtt, v.Payload)
@@ -485,6 +574,7 @@ HANDLE_REMOTE_FAILURE:
 	// out first to allow the normal UDP-based acks to come in.
 	v := <-ackCh
 	if v.Complete {
+		m.recoverNode(node.Name, node.generation())
 		return
 	}
 
@@ -494,6 +584,7 @@ HANDLE_REMOTE_FAILURE:
 	for didContact := range fallbackCh {
 		if didContact {
 			m.logger.Printf("[WARN] memberlist: Was able to connect to %s over TCP but UDP probes failed, network may be misconfigured", node.Name)
+			m.recoverNode(node.Name, node.generation())
 			return
 		}
 	}
@@ -516,7 +607,7 @@ HANDLE_REMOTE_FAILURE:
 
 	// No acks received from target, suspect it as failed.
 	m.logger.Printf("[INFO] memberlist: Suspect %s has failed, no acks received", node.Name)
-	s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
+	s := suspect{Incarnation: node.Incarnation, Generation: node.generation(), Node: node.Name, From: m.config.Name}
 	m.suspectNode(&s)
 }
 
@@ -810,6 +901,13 @@ func (m *Memberlist) nextIncarnation() uint32 {
 	return m.incarnation.Add(1)
 }
 
+// newLocalGeneration returns a fresh lifecycle generation for a running
+// process. Wall time makes a restarted member numerically newer than the
+// generation its peers remembered from the previous process.
+func newLocalGeneration() uint64 {
+	return uint64(time.Now().UnixNano())
+}
+
 // skipIncarnation adds the positive offset to the incarnation number.
 func (m *Memberlist) skipIncarnation(offset uint32) uint32 {
 	return m.incarnation.Add(offset)
@@ -916,6 +1014,8 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 		inc = m.skipIncarnation(accusedInc - inc + 1)
 	}
 	me.Incarnation = inc
+	generation := advanceGeneration(0, inc, me.generation())
+	me.setGeneration(generation)
 
 	// Decrease our health because we are being asked to refute a problem.
 	m.awareness.ApplyDelta(1)
@@ -923,6 +1023,7 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 	// Format and broadcast an alive message.
 	a := alive{
 		Incarnation: inc,
+		Generation:  generation,
 		Node:        me.Name,
 		Addr:        me.Addr,
 		Port:        me.Port,
@@ -933,6 +1034,104 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 		},
 	}
 	m.encodeAndBroadcast(me.Addr.String(), aliveMsg, a)
+}
+
+// cancelNodeTimerLocked stops and removes the active suspicion timer for a
+// node. It MUST be called while nodeLock is held. A callback that already
+// started is fenced by the generation/timer-identity check in its closure.
+func (m *Memberlist) cancelNodeTimerLocked(name string) {
+	if timer, ok := m.nodeTimers[name]; ok {
+		timer.Cancel()
+		delete(m.nodeTimers, name)
+	}
+}
+
+// RecoverNode immediately clears a current-generation suspicion and broadcasts
+// an alive/recovery declaration. The variadic generation is optional so the
+// common current-generation call is RecoverNode(name); when supplied, an older
+// generation cannot recover or displace a newer suspicion lifecycle.
+func (m *Memberlist) RecoverNode(name string, expectedGeneration ...uint64) bool {
+	var generation uint64
+	if len(expectedGeneration) > 0 {
+		generation = expectedGeneration[0]
+	}
+
+	m.nodeLock.Lock()
+	defer m.nodeLock.Unlock()
+
+	state, ok := m.nodeMap[name]
+	if !ok || state.State != StateSuspect {
+		return false
+	}
+
+	currentGeneration := state.generation()
+	if generation != 0 && generation < currentGeneration {
+		return false
+	}
+	if generation > currentGeneration {
+		state.setGeneration(generation)
+	}
+
+	m.cancelNodeTimerLocked(name)
+	state.setState(StateAlive)
+	state.StateChange = time.Now()
+
+	a := alive{
+		Incarnation: state.Incarnation,
+		Generation:  state.generation(),
+		Node:        state.Name,
+		Addr:        state.Addr,
+		Port:        state.Port,
+		Meta:        state.Meta,
+		Vsn: []uint8{
+			state.PMin, state.PMax, state.PCur,
+			state.DMin, state.DMax, state.DCur,
+		},
+	}
+	m.encodeBroadcastNotify(name, aliveMsg, &a, nil)
+	return true
+}
+
+func (m *Memberlist) recoverNode(name string, expectedGeneration ...uint64) bool {
+	return m.RecoverNode(name, expectedGeneration...)
+}
+
+// handleNegativeAck is the state-machine entry point for a denial/refutation of
+// a suspicion. It is intentionally separate from the SWIM indirect nackResp,
+// which reports a failed indirect probe rather than a recovery confirmation.
+func (m *Memberlist) handleNegativeAck(node string, generation ...uint64) bool {
+	return m.RecoverNode(node, generation...)
+}
+
+// notifyJoinLocked emits an edge-triggered join event using an isolated node
+// snapshot. The caller must hold nodeLock so the copy and transition are
+// linearized together.
+func (m *Memberlist) notifyJoinLocked(state *nodeState) {
+	if m.config.Events == nil {
+		return
+	}
+	node := state.Node
+	m.config.Events.NotifyJoin(&node)
+}
+
+// notifyLeaveLocked emits an edge-triggered leave event using an isolated node
+// snapshot. The caller must hold nodeLock.
+func (m *Memberlist) notifyLeaveLocked(state *nodeState) {
+	if m.config.Events == nil {
+		return
+	}
+	node := state.Node
+	m.config.Events.NotifyLeave(&node)
+}
+
+// notifyUpdateLocked emits an update event using an isolated node snapshot. The
+// caller must hold nodeLock.
+func (m *Memberlist) notifyUpdateLocked(state *nodeState) {
+	if m.config.Events == nil {
+		return
+	}
+	node := state.Node
+	m.config.Events.NotifyUpdate(&node)
 }
 
 // aliveNode is invoked by the network layer when we get a message about a
@@ -1000,10 +1199,11 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		}
 		state = &nodeState{
 			Node: Node{
-				Name: a.Node,
-				Addr: a.Addr,
-				Port: a.Port,
-				Meta: a.Meta,
+				Name:       a.Node,
+				Addr:       a.Addr,
+				Port:       a.Port,
+				Meta:       a.Meta,
+				Generation: messageGeneration(a.Generation, a.Incarnation),
 			},
 			State: StateDead,
 		}
@@ -1015,6 +1215,8 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 			state.DMax = a.Vsn[4]
 			state.DCur = a.Vsn[5]
 		}
+		state.setGeneration(state.generation())
+		state.setState(StateDead)
 
 		// Add to map
 		m.nodeMap[a.Node] = state
@@ -1044,12 +1246,17 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 			canReclaim := (m.config.DeadNodeReclaimTime > 0 &&
 				time.Since(state.StateChange) > m.config.DeadNodeReclaimTime)
 
-			// Allow the address to be updated if a dead node is being replaced.
-			if state.State == StateLeft || (state.State == StateDead && canReclaim) {
-				m.logger.Printf("[INFO] memberlist: Updating address for left or failed node %s from %v:%d to %v:%d",
+			// A partition-timeout Dead node can be replaced once the reclaim
+			// window has elapsed. A voluntarily Left node takes a different
+			// terminal path: the address is only replaced when the generation
+			// fence below proves this is a newer member instance. Leaving
+			// updatesNode false prevents a same-generation alive replay from
+			// bypassing that fence and pulling the node back into membership.
+			if state.State == StateDead && canReclaim {
+				m.logger.Printf("[INFO] memberlist: Updating address for failed node %s from %v:%d to %v:%d",
 					state.Name, state.Addr, state.Port, net.IP(a.Addr), a.Port)
 				updatesNode = true
-			} else {
+			} else if state.State != StateLeft {
 				m.logger.Printf("[ERR] memberlist: Conflicting address for %s. Mine: %v:%d Theirs: %v:%d Old state: %v",
 					state.Name, state.Addr, state.Port, net.IP(a.Addr), a.Port, state.State)
 
@@ -1068,19 +1275,35 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		}
 	}
 
-	// Bail if the incarnation number is older, and this is not about us
+	// Generation and incarnation fences. A strictly older transition can never
+	// resurrect or alter the current member generation.
 	isLocalNode := state.Name == m.config.Name
-	if a.Incarnation <= state.Incarnation && !isLocalNode && !updatesNode {
+	olderGeneration := staleGeneration(a.Generation, a.Incarnation, state)
+	newerGeneration := messageGeneration(a.Generation, a.Incarnation) > state.generation()
+	if olderGeneration {
 		return
 	}
 
-	// Bail if strictly less and this is about us
-	if a.Incarnation < state.Incarnation && isLocalNode {
+	// Bail if the incarnation number is older or equal, and this is not about
+	// us. A newer explicit generation is allowed to reuse a low incarnation
+	// after a process restart; address reclaim is the other allowed bypass.
+	if a.Incarnation <= state.Incarnation && !isLocalNode && !updatesNode && !newerGeneration {
 		return
+	}
+
+	// Bail if strictly less and this is about us. A newer generation is a new
+	// instance and is handled by the refutation/rejoin logic below.
+	if a.Incarnation < state.Incarnation && isLocalNode && !newerGeneration {
+		return
+	}
+
+	// Populate the normalized generation before broadcasting or notifying.
+	if a.Generation == 0 {
+		a.Generation = messageGeneration(0, a.Incarnation)
 	}
 
 	// Clear out any suspicion timer that may be in effect.
-	delete(m.nodeTimers, a.Node)
+	m.cancelNodeTimerLocked(a.Node)
 
 	// Store the old state and meta data
 	oldState := state.State
@@ -1106,6 +1329,7 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		// we just ignore, but we may need to refute.
 		//
 		if a.Incarnation == state.Incarnation &&
+			a.Generation == state.generation() &&
 			bytes.Equal(a.Meta, state.Meta) &&
 			bytes.Equal(a.Vsn, versions) {
 			return
@@ -1127,11 +1351,12 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 
 		// Update the state and incarnation number
 		state.Incarnation = a.Incarnation
+		state.setGeneration(advanceGeneration(a.Generation, a.Incarnation, state.generation()))
 		state.Meta = a.Meta
 		state.Addr = a.Addr
 		state.Port = a.Port
 		if state.State != StateAlive {
-			state.State = StateAlive
+			state.setState(StateAlive)
 			state.StateChange = time.Now()
 		}
 	}
@@ -1139,16 +1364,14 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	// Update metrics
 	metrics.IncrCounterWithLabels([]string{"memberlist", "msg", "alive"}, 1, m.metricLabels)
 
-	// Notify the delegate of any relevant updates
-	if m.config.Events != nil {
-		if oldState == StateDead || oldState == StateLeft {
-			// if Dead/Left -> Alive, notify of join
-			m.config.Events.NotifyJoin(&state.Node)
-
-		} else if !bytes.Equal(oldMeta, state.Meta) {
-			// if Meta changed, trigger an update notification
-			m.config.Events.NotifyUpdate(&state.Node)
-		}
+	// Notify the delegate of any relevant updates. The state lock linearizes
+	// this notification with the transition and suppresses repeated edges.
+	if oldState == StateDead || oldState == StateLeft {
+		// if Dead/Left -> Alive, notify of join
+		m.notifyJoinLocked(state)
+	} else if !bytes.Equal(oldMeta, state.Meta) {
+		// if Meta changed, trigger an update notification
+		m.notifyUpdateLocked(state)
 	}
 }
 
@@ -1164,9 +1387,12 @@ func (m *Memberlist) suspectNode(s *suspect) {
 		return
 	}
 
-	// Ignore old incarnation numbers
-	if s.Incarnation < state.Incarnation {
+	// Ignore transitions from an older generation/incarnation.
+	if staleGeneration(s.Generation, s.Incarnation, state) {
 		return
+	}
+	if s.Generation == 0 {
+		s.Generation = messageGeneration(0, s.Incarnation)
 	}
 
 	// See if there's a suspicion timer we can confirm. If the info is new
@@ -1174,14 +1400,24 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// independent confirmations to flow even when a node probes a node
 	// that's already suspect.
 	if timer, ok := m.nodeTimers[s.Node]; ok {
-		if timer.Confirm(s.From) {
-			m.encodeAndBroadcast(s.Node, suspectMsg, s)
+		sameGeneration := s.Generation == state.generation() &&
+			s.Incarnation == state.Incarnation
+		if sameGeneration {
+			if timer.Confirm(s.From) {
+				m.encodeAndBroadcast(s.Node, suspectMsg, s)
+			}
+			return
 		}
-		return
+
+		// This suspect is for a newer generation. Retire the old timer so a
+		// stale timeout cannot terminate the new lifecycle, then arm a fresh
+		// timer below.
+		m.cancelNodeTimerLocked(s.Node)
 	}
 
-	// Ignore non-alive nodes
-	if state.State != StateAlive {
+	// Ignore terminal/non-live states. StateSuspect is allowed through only
+	// when a newer generation just superseded its old timer above.
+	if state.State != StateAlive && state.State != StateSuspect {
 		return
 	}
 
@@ -1199,9 +1435,9 @@ func (m *Memberlist) suspectNode(s *suspect) {
 
 	// Update the state
 	state.Incarnation = s.Incarnation
-	state.State = StateSuspect
-	changeTime := time.Now()
-	state.StateChange = changeTime
+	state.setGeneration(advanceGeneration(s.Generation, s.Incarnation, state.generation()))
+	state.setState(StateSuspect)
+	state.StateChange = time.Now()
 
 	// Setup a suspicion timer. Given that we don't have any known phase
 	// relationship with our peers, we set up k such that we hit the nominal
@@ -1220,14 +1456,25 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	// Compute the timeouts based on the size of the cluster.
 	min := suspicionTimeout(m.config.SuspicionMult, n, m.config.ProbeInterval)
 	max := time.Duration(m.config.SuspicionMaxTimeoutMult) * min
+
+	var susp *suspicion
 	fn := func(numConfirmations int) {
 		var d *dead
 
 		m.nodeLock.Lock()
 		state, ok := m.nodeMap[s.Node]
-		timeout := ok && state.State == StateSuspect && state.StateChange.Equal(changeTime)
+		timeout := ok &&
+			state.State == StateSuspect &&
+			state.Incarnation == s.Incarnation &&
+			state.generation() == s.Generation &&
+			m.nodeTimers[s.Node] == susp
 		if timeout {
-			d = &dead{Incarnation: state.Incarnation, Node: state.Name, From: m.config.Name}
+			d = &dead{
+				Incarnation: state.Incarnation,
+				Generation:  state.generation(),
+				Node:        state.Name,
+				From:        m.config.Name,
+			}
 		}
 		m.nodeLock.Unlock()
 
@@ -1242,7 +1489,8 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			m.deadNode(d)
 		}
 	}
-	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+	susp = newSuspicion(s.From, k, min, max, fn)
+	m.nodeTimers[s.Node] = susp
 }
 
 // deadNode is invoked by the network layer when we get a message
@@ -1257,13 +1505,16 @@ func (m *Memberlist) deadNode(d *dead) {
 		return
 	}
 
-	// Ignore old incarnation numbers
-	if d.Incarnation < state.Incarnation {
+	// Ignore transitions from an older generation/incarnation.
+	if staleGeneration(d.Generation, d.Incarnation, state) {
 		return
+	}
+	if d.Generation == 0 {
+		d.Generation = messageGeneration(0, d.Incarnation)
 	}
 
 	// Clear out any suspicion timer that may be in effect.
-	delete(m.nodeTimers, d.Node)
+	m.cancelNodeTimerLocked(d.Node)
 
 	// Ignore if node is already dead
 	if state.DeadOrLeft() {
@@ -1290,20 +1541,19 @@ func (m *Memberlist) deadNode(d *dead) {
 
 	// Update the state
 	state.Incarnation = d.Incarnation
+	state.setGeneration(advanceGeneration(d.Generation, d.Incarnation, state.generation()))
 
 	// If the dead message was send by the node itself, mark it is left
 	// instead of dead.
 	if d.Node == d.From {
-		state.State = StateLeft
+		state.setState(StateLeft)
 	} else {
-		state.State = StateDead
+		state.setState(StateDead)
 	}
 	state.StateChange = time.Now()
 
-	// Notify of death
-	if m.config.Events != nil {
-		m.config.Events.NotifyLeave(&state.Node)
-	}
+	// Notify of death exactly once for this terminal state edge.
+	m.notifyLeaveLocked(state)
 }
 
 // mergeState is invoked by the network layer when we get a Push/Pull
@@ -1314,6 +1564,7 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 		case StateAlive:
 			a := alive{
 				Incarnation: r.Incarnation,
+				Generation:  r.Generation,
 				Node:        r.Name,
 				Addr:        r.Addr,
 				Port:        r.Port,
@@ -1323,14 +1574,14 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 			m.aliveNode(&a, nil, false)
 
 		case StateLeft:
-			d := dead{Incarnation: r.Incarnation, Node: r.Name, From: r.Name}
+			d := dead{Incarnation: r.Incarnation, Generation: r.Generation, Node: r.Name, From: r.Name}
 			m.deadNode(&d)
 		case StateDead:
 			// If the remote node believes a node is dead, we prefer to
 			// suspect that node instead of declaring it dead instantly
 			fallthrough
 		case StateSuspect:
-			s := suspect{Incarnation: r.Incarnation, Node: r.Name, From: m.config.Name}
+			s := suspect{Incarnation: r.Incarnation, Generation: r.Generation, Node: r.Name, From: m.config.Name}
 			m.suspectNode(&s)
 		}
 	}

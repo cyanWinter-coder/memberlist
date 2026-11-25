@@ -6,7 +6,10 @@ package memberlist
 // EventDelegate is a simpler delegate that is used only to receive
 // notifications about members joining and leaving. The methods in this
 // delegate may be called by multiple goroutines, but never concurrently.
-// This allows you to reason about ordering.
+// Transitions are linearized by the node state lock, and notifications are
+// emitted synchronously in that transition order. Repeated/no-op transitions
+// do not produce duplicate notifications. This allows you to reason about
+// ordering.
 type EventDelegate interface {
 	// NotifyJoin is invoked when a node is detected to have joined.
 	// The Node argument must not be modified.

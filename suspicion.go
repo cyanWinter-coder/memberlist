@@ -5,6 +5,7 @@ package memberlist
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -36,6 +37,11 @@ type suspicion struct {
 	// timer is the underlying timer that implements the timeout.
 	timer *time.Timer
 
+	// timeoutOnce ensures a racing timer expiry, accelerated confirmation,
+	// direct test invocation, or cancellation can run the terminal callback at
+	// most once.
+	timeoutOnce sync.Once
+
 	// f is the function to call when the timer expires. We hold on to this
 	// because there are cases where we call it directly.
 	timeoutFn func()
@@ -62,9 +68,12 @@ func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn f
 	s.confirmations[from] = struct{}{}
 
 	// Pass the number of confirmations into the timeout function for
-	// easy telemetry.
+	// easy telemetry. sync.Once prevents duplicate terminal transitions when
+	// the timer and the accelerated direct-fire path race.
 	s.timeoutFn = func() {
-		fn(int(s.n.Load()))
+		s.timeoutOnce.Do(func() {
+			fn(int(s.n.Load()))
+		})
 	}
 
 	// If there aren't any confirmations to be made then take the min
@@ -97,6 +106,18 @@ func remainingSuspicionTime(n, k int32, elapsed time.Duration, min, max time.Dur
 	// We have to take into account the amount of time that has passed so
 	// far, so we get the right overall timeout.
 	return timeout - elapsed
+}
+
+// Cancel stops the underlying timer. It is best-effort: a callback that has
+// already started is additionally fenced by the caller's generation and timer
+// identity checks. Cancel is idempotent.
+func (s *suspicion) Cancel() {
+	s.timer.Stop()
+}
+
+// Stop is the conventional alias for Cancel.
+func (s *suspicion) Stop() {
+	s.Cancel()
 }
 
 // Confirm registers that a possibly new peer has also determined the given
